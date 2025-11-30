@@ -687,14 +687,14 @@ class MarketWorker(threading.Thread):
         self.engine = engine
         self.exchange = exchange
         self.testnet = testnet
-
-        PING_INTERVAL = 10        # send ping every 10 sec
+        
+                PING_INTERVAL = 10        # send ping every 10 sec
         SILENT_MAX = 25           # if no messages for 25 sec, force reconnect
 
         last_ping = time.time()
         last_msg_time = time.time()
 
-    while not self.stop_flag:
+        while not self.stop_flag:
             try:
                 msg = self.ws.recv()
 
