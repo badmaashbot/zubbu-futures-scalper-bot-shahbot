@@ -57,14 +57,14 @@ async def tg(msg: str):
     if time.time() - _last_tg < TELEGRAM_CD:
         return
     _last_tg = time.time()
-    try:
-        async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+        try:
             await session.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                 data={"chat_id": TG_CHAT_ID, "text": msg}
             )
-    except Exception as e:
-        log.warning("Telegram error: %s", e)
+        except Exception as e:
+            log.warning("Telegram error: %s", e)
 
 # ------------------------------------------------------------
 # BOOK – always consistent
