@@ -660,19 +660,25 @@ class DecisionEngine:
             f"📌 ENTRY | {symbol}\nSide: {side}\nEntry: {fill_price}\nTP: {tp}\nSL: {sl}"
         )
 # ================================================================
-# MARKET WORKER (WEBSOCKET + L2 DATA)
+# MARKET WORKER (FIXED — STABLE WEBSOCKET + L2 FEED)
 # ================================================================
+
+# Recommended safer WS settings
+WS_SILENCE_SEC = 8.0       # was 3.0 — prevents over-reconnect spam
+STALE_OB_MAX_SEC = 5.0     # was 2.0 — safer on slow networks
 
 class MarketWorker(threading.Thread):
     """
-    - Connects to Bybit public websocket v5.
-    - Subscribes to orderbook.25.<SYMBOL> and publicTrade.<SYMBOL>
-    - Maintains:
-        * Level 2 orderbook
-        * Trades buffer
-        * 1s + 5s candles
-        * Price series for unpredictability checks
-    - Periodically calls DecisionEngine.evaluate()
+    - Connects to Bybit public WS v5 (mainnet or testnet)
+    - Subscribes to:
+         orderbook.25.<symbol>
+         publicTrade.<symbol>
+    - Keeps:
+         Level-2 orderbook
+         Trades
+         1s + 5s candles
+         Price timeline
+    - Calls DecisionEngine.evaluate() safely
     """
 
     def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool = True):
@@ -689,64 +695,55 @@ class MarketWorker(threading.Thread):
         self.ws: Optional[websocket.WebSocketApp] = None
         self._stop = threading.Event()
 
-        # Orderbook: price -> size
-        self.book: Dict[str, Dict[float, float]] = {"bids": {}, "asks": {}}
-        self.last_ob_ts: float = 0.0
+        self.book = {"bids": {}, "asks": {}}
+        self.last_ob_ts = 0.0
 
-        # Trades buffer
-        self.trades: deque = deque(maxlen=1000)
+        self.trades = deque(maxlen=1000)
+        self.prices = deque(maxlen=1000)
 
-        # Price series (for unpredictability)
-        self.prices: deque = deque(maxlen=1000)
+        self.c1 = []
+        self.c5 = []
 
-        # Candles
-        self.c1: List[Dict[str, Any]] = []  # 1s
-        self.c5: List[Dict[str, Any]] = []  # 5s
-
-        # Evaluation timing
         self.last_eval = 0.0
 
-        # WS inactivity
         self.last_msg_ts = now_ts()
+
     # ------------------------------------------------------------
     # WEBSOCKET CALLBACKS
     # ------------------------------------------------------------
     def on_open(self, ws):
-        logger.info(f"{self.symbol}: WS opened, subscribing...")
+        logger.info(f"{self.symbol}: WS opened.")
         try:
             sub = {"op": "subscribe", "args": [self.topic_ob, self.topic_trade]}
             ws.send(json.dumps(sub))
-            logger.info(f"{self.symbol}: subscribed to {self.topic_ob} & {self.topic_trade}")
+            logger.info(f"{self.symbol}: subscribed to L2 + trades")
         except Exception as e:
-            logger.error(f"{self.symbol}: subscribe failed: {e}")
+            logger.error(f"{self.symbol}: subscribe error: {e}")
 
     def on_message(self, ws, message: str):
         self.last_msg_ts = now_ts()
         try:
             msg = json.loads(message)
-        except Exception:
+        except:
             return
 
         try:
-            topic = msg.get("topic") or ""
-            if topic.startswith("orderbook."):
+            topic = msg.get("topic", "")
+            if topic.startswith("orderbook"):
                 self.handle_ob(msg)
-            elif topic.startswith("publicTrade."):
+            elif topic.startswith("publicTrade"):
                 self.handle_trades(msg)
-            else:
-                # ignore non-data messages
-                pass
         except Exception as e:
-            logger.exception(f"{self.symbol}: on_message error: {e}")
+            logger.exception(f"{self.symbol}: msg error: {e}")
 
     def on_error(self, ws, error):
         logger.error(f"{self.symbol}: WS error: {error}")
 
     def on_close(self, ws, code, msg):
-        logger.warning(f"{self.symbol}: WS closed code={code} msg={msg}")
+        logger.warning(f"{self.symbol}: WS closed: {code} {msg}")
 
     # ------------------------------------------------------------
-    # CONNECT / RECONNECT
+    # CONNECT / RECONNECT LOOP (NO SPAM)
     # ------------------------------------------------------------
     def connect(self):
         self.ws = websocket.WebSocketApp(
@@ -757,164 +754,122 @@ class MarketWorker(threading.Thread):
             on_close=self.on_close,
         )
 
+        backoff = 1
+
         while not self._stop.is_set():
             try:
+                logger.info(f"{self.symbol}: WS connecting...")
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                logger.exception(f"{self.symbol}: run_forever exception: {e}")
+                logger.error(f"{self.symbol}: WS crash: {e}")
 
-            if not self._stop.is_set():
-                logger.info(f"{self.symbol}: reconnecting WS in 1s...")
-                time.sleep(1.0)
+            if self._stop.is_set():
+                break
+
+            logger.warning(f"{self.symbol}: WS reconnecting in {backoff}s")
+            time.sleep(backoff)
+
+            # exponential but capped
+            backoff = min(backoff * 2, 8)
 
     def close(self):
         self._stop.set()
         try:
             if self.ws:
                 self.ws.close()
-        except Exception:
+        except:
             pass
 
     # ------------------------------------------------------------
     # ORDERBOOK HANDLER
     # ------------------------------------------------------------
-    def handle_ob(self, msg: Dict[str, Any]):
+    def handle_ob(self, msg):
         try:
             data = msg.get("data")
             if not data:
                 return
 
             item = data[0] if isinstance(data, list) else data
-            typ = msg.get("type") or item.get("type") or ""
+            typ = msg.get("type") or item.get("type", "")
 
             # SNAPSHOT
             if typ == "snapshot" or ("bids" in item and "asks" in item):
-                bids = item.get("bids", [])
-                asks = item.get("asks", [])
-
                 self.book["bids"].clear()
                 self.book["asks"].clear()
 
-                # BIDS
-                for b in bids:
-                    if isinstance(b, (list, tuple)) and len(b) >= 2:
-                        price = float(b[0])
-                        size = float(b[1])
-                    elif isinstance(b, dict):
-                        price = float(b.get("price", 0.0))
-                        size = float(b.get("size", 0.0))
-                    else:
-                        continue
-                    if size > 0:
-                        self.book["bids"][price] = size
+                for p, q in item.get("bids", []):
+                    p = float(p); q = float(q)
+                    if q > 0:
+                        self.book["bids"][p] = q
 
-                # ASKS
-                for a in asks:
-                    if isinstance(a, (list, tuple)) and len(a) >= 2:
-                        price = float(a[0])
-                        size = float(a[1])
-                    elif isinstance(a, dict):
-                        price = float(a.get("price", 0.0))
-                        size = float(a.get("size", 0.0))
-                    else:
-                        continue
-                    if size > 0:
-                        self.book["asks"][price] = size
+                for p, q in item.get("asks", []):
+                    p = float(p); q = float(q)
+                    if q > 0:
+                        self.book["asks"][p] = q
 
-                ts = float(item.get("ts", now_ts()))
-                self.last_ob_ts = ts
+                self.last_ob_ts = float(item.get("ts", now_ts()))
 
-                # mid price
-                try:
-                    best_bid = max(self.book["bids"])
-                    best_ask = min(self.book["asks"])
-                    mid = (best_bid + best_ask) / 2.0
+                if self.book["bids"] and self.book["asks"]:
+                    mid = (max(self.book["bids"]) + min(self.book["asks"])) / 2
                     self.prices.append((now_ts(), mid))
-                except Exception:
-                    pass
 
             # DELTA
-            elif typ == "delta" or any(k in item for k in ("delete", "update", "insert")):
-                ts = float(item.get("ts", now_ts()))
-                self.last_ob_ts = ts
+            else:
+                self.last_ob_ts = float(item.get("ts", now_ts()))
 
-                def apply_list(lst, side: str):
-                    book_side = self.book["bids"] if side == "buy" else self.book["asks"]
-                    for entry in lst:
-                        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                            price = float(entry[0])
-                            size = float(entry[1])
-                        elif isinstance(entry, dict):
-                            price = float(entry.get("price", 0.0))
-                            size = float(entry.get("size", 0.0))
+                def apply(lst, side):
+                    bookside = self.book["bids"] if side == "buy" else self.book["asks"]
+                    for p, q in lst:
+                        p = float(p); q = float(q)
+                        if q <= 0:
+                            bookside.pop(p, None)
                         else:
-                            continue
-                        if size <= 0:
-                            if price in book_side:
-                                del book_side[price]
-                        else:
-                            book_side[price] = size
+                            bookside[p] = q
 
                 for k in ("delete", "update", "insert"):
-                    parts = item.get(k, {})
-                    if isinstance(parts, dict):
-                        bids = parts.get("bids", [])
-                        asks = parts.get("asks", [])
-                        if bids:
-                            apply_list(bids, "buy")
-                        if asks:
-                            apply_list(asks, "sell")
+                    part = item.get(k)
+                    if isinstance(part, dict):
+                        if "bids" in part: apply(part["bids"], "buy")
+                        if "asks" in part: apply(part["asks"], "sell")
 
-                try:
-                    if self.book["bids"] and self.book["asks"]:
-                        best_bid = max(self.book["bids"])
-                        best_ask = min(self.book["asks"])
-                        mid = (best_bid + best_ask) / 2.0
-                        self.prices.append((now_ts(), mid))
-                except Exception:
-                    pass
+                if self.book["bids"] and self.book["asks"]:
+                    mid = (max(self.book["bids"]) + min(self.book["asks"])) / 2
+                    self.prices.append((now_ts(), mid))
 
         except Exception as e:
-            logger.exception(f"{self.symbol}: handle_ob failed: {e}")
+            logger.exception(f"{self.symbol}: OB error: {e}")
 
     # ------------------------------------------------------------
     # TRADES HANDLER
     # ------------------------------------------------------------
-    def handle_trades(self, msg: Dict[str, Any]):
+    def handle_trades(self, msg):
         try:
-            data = msg.get("data")
-            if not data:
+            arr = msg.get("data")
+            if not arr:
                 return
-
-            arr = data if isinstance(data, list) else [data]
+            if not isinstance(arr, list):
+                arr = [arr]
 
             for item in arr:
-                price = float(item.get("price") or item.get("p") or 0.0)
-                size = float(item.get("size") or item.get("q") or item.get("qty") or 0.0)
-                side = (item.get("side") or item.get("S") or "").lower()
-
-                if side not in ("buy", "sell"):
-                    side = "buy"
+                price = float(item.get("price") or item.get("p", 0))
+                size = float(item.get("size") or item.get("q", 0))
+                side = (item.get("side") or "buy").lower()
 
                 ts = float(item.get("ts") or item.get("trade_time_ms") or now_ts())
-                ts = ts / 1000.0 if ts > 1e12 else ts
+                if ts > 1e12:
+                    ts /= 1000.0
 
-                trade = {"ts": ts, "price": price, "size": size, "side": side}
-                self.trades.append(trade)
+                self.trades.append({"ts": ts, "price": price, "size": size, "side": side})
 
-                # also push to prices
-                try:
-                    self.prices.append((now_ts(), price))
-                except Exception:
-                    pass
+                self.prices.append((now_ts(), price))
 
             self.update_candles()
 
         except Exception as e:
-            logger.exception(f"{self.symbol}: handle_trades failed: {e}")
+            logger.exception(f"{self.symbol}: trades error: {e}")
 
     # ------------------------------------------------------------
-    # CANDLE BUILDER (1s and 5s)
+    # CANDLES
     # ------------------------------------------------------------
     def update_candles(self):
         try:
@@ -922,19 +877,15 @@ class MarketWorker(threading.Thread):
                 return
 
             trades = list(self.trades)
-            for t in trades:
-                if t["ts"] > 1e12:
-                    t["ts"] = t["ts"] / 1000.0
-
             now = now_ts()
-            c1_map: Dict[int, Dict[str, Any]] = {}
+            c1_map = {}
 
             for t in trades:
                 sec = int(t["ts"])
                 if sec < int(now) - 120:
                     continue
-                entry = c1_map.get(sec)
-                if not entry:
+
+                if sec not in c1_map:
                     c1_map[sec] = {
                         "ts": sec,
                         "open": t["price"],
@@ -944,42 +895,32 @@ class MarketWorker(threading.Thread):
                         "volume": t["size"],
                     }
                 else:
-                    entry["high"] = max(entry["high"], t["price"])
-                    entry["low"] = min(entry["low"], t["price"])
-                    entry["close"] = t["price"]
-                    entry["volume"] += t["size"]
+                    c1_map[sec]["high"] = max(c1_map[sec]["high"], t["price"])
+                    c1_map[sec]["low"] = min(c1_map[sec]["low"], t["price"])
+                    c1_map[sec]["close"] = t["price"]
+                    c1_map[sec]["volume"] += t["size"]
 
-            c1_list = [c1_map[k] for k in sorted(c1_map.keys())]
-            self.c1 = c1_list[-60:]
+            self.c1 = [c1_map[k] for k in sorted(c1_map)][-60:]
 
-            # 5-second candles
-            c5_map: Dict[int, Dict[str, Any]] = {}
+            # Build 5s candles
+            c5_map = {}
             for c in self.c1:
                 bucket = (c["ts"] // 5) * 5
-                entry = c5_map.get(bucket)
-                if not entry:
-                    c5_map[bucket] = {
-                        "ts": bucket,
-                        "open": c["open"],
-                        "high": c["high"],
-                        "low": c["low"],
-                        "close": c["close"],
-                        "volume": c["volume"],
-                    }
+                if bucket not in c5_map:
+                    c5_map[bucket] = c.copy()
                 else:
-                    entry["high"] = max(entry["high"], c["high"])
-                    entry["low"] = min(entry["low"], c["low"])
-                    entry["close"] = c["close"]
-                    entry["volume"] += c["volume"]
+                    c5_map[bucket]["high"] = max(c5_map[bucket]["high"], c["high"])
+                    c5_map[bucket]["low"] = min(c5_map[bucket]["low"], c["low"])
+                    c5_map[bucket]["close"] = c["close"]
+                    c5_map[bucket]["volume"] += c["volume"]
 
-            c5_list = [c5_map[k] for k in sorted(c5_map.keys())]
-            self.c5 = c5_list[-60:]
+            self.c5 = [c5_map[k] for k in sorted(c5_map)][-60:]
 
         except Exception as e:
-            logger.exception(f"{self.symbol}: update_candles failed: {e}")
+            logger.exception(f"{self.symbol}: candle error: {e}")
 
     # ------------------------------------------------------------
-    # MAYBE EVALUATE (THROTTLED)
+    # EVALUATION LOOP
     # ------------------------------------------------------------
     def maybe_eval(self):
         try:
@@ -987,34 +928,30 @@ class MarketWorker(threading.Thread):
             if now - self.last_eval < SCAN_INTERVAL:
                 return
 
-            if not self.book["bids"] and not self.book["asks"]:
+            if not self.book["bids"] or not self.book["asks"]:
                 return
 
-            trades_list = list(self.trades)
             prices_list = list(self.prices)
-
+            trades_list = list(self.trades)
             self.update_candles()
 
-            try:
-                self.engine.evaluate(
-                    self.symbol,
-                    self.book,
-                    trades_list,
-                    self.c5,
-                    self.c1,
-                    prices_list,
-                    self.last_ob_ts,
-                )
-            except Exception as e:
-                logger.exception(f"{self.symbol}: engine.evaluate error: {e}")
+            self.engine.evaluate(
+                self.symbol,
+                self.book,
+                trades_list,
+                self.c5,
+                self.c1,
+                prices_list,
+                self.last_ob_ts,
+            )
 
             self.last_eval = now
 
         except Exception as e:
-            logger.exception(f"{self.symbol}: maybe_eval failed: {e}")
+            logger.exception(f"{self.symbol}: eval error: {e}")
 
     # ------------------------------------------------------------
-    # MAIN RUN LOOP
+    # MAIN RUN LOOP (NO RECONNECT SPAM)
     # ------------------------------------------------------------
     def run(self):
         th = threading.Thread(target=self.connect, daemon=True)
@@ -1022,26 +959,28 @@ class MarketWorker(threading.Thread):
 
         try:
             while not self._stop.is_set():
-                # WS inactivity check
+
+                # if WS silent too long → reconnect 1 time
                 if now_ts() - self.last_msg_ts > WS_SILENCE_SEC:
-                    logger.warning(f"{self.symbol}: WS silence, reconnecting...")
+                    logger.warning(f"{self.symbol}: WS silent → reconnect")
                     try:
                         if self.ws:
                             self.ws.close()
-                    except Exception:
+                    except:
                         pass
-                    time.sleep(1.0)
+
+                    # 🔥 IMPORTANT: reset timer to avoid spam loop
+                    self.last_msg_ts = now_ts()
+
+                    time.sleep(1)
 
                 self.maybe_eval()
                 time.sleep(0.2)
 
         except Exception as e:
-            logger.exception(f"{self.symbol}: worker run failed: {e}")
+            logger.exception(f"{self.symbol}: worker crash: {e}")
         finally:
-            try:
-                self.close()
-            except Exception:
-                pass
+            self.close()
 # ================================================================
 # MAIN
 # ================================================================
@@ -1058,10 +997,10 @@ def main() -> None:
     # Exchange client
     exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
 
-    # Safety: close leftover positions before starting
+    # Clear leftover positions
     emergency_close_all(exchange, SYMBOLS)
 
-    # Fetch starting equity for kill switch
+    # Get starting equity for kill-switch
     try:
         STARTING_EQUITY = exchange.get_balance()
     except Exception as e:
@@ -1080,42 +1019,40 @@ def main() -> None:
         f"Kill-switch at {GLOBAL_KILL_TRIGGER * 100:.1f}% loss."
     )
 
-    # Set leverage for each symbol
+    # Set leverage for all symbols
     for s in SYMBOLS:
         try:
             exchange.set_leverage(s, LEVERAGE)
         except Exception as e:
             logger.warning(f"{s}: leverage set failed: {e}")
 
-    # Initialize decision engine
+    # Decision engine (brain)
     engine = DecisionEngine(exchange, SYMBOLS)
 
-    # Start a MarketWorker thread for each symbol
-    workers: List[MarketWorker] = []
+    # Start workers (WS + L2 + evaluate)
+    workers = []
     for s in SYMBOLS:
         w = MarketWorker(s, engine, exchange, TESTNET)
         w.start()
         workers.append(w)
 
-    logger.info("Workers started. Bot is running. Press Ctrl+C to stop.")
+    logger.info("Workers started. Bot running…")
 
-    # Main loop keeps the bot alive
     try:
         while True:
-            time.sleep(1.0)
+            time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Stopping workers…")
         tg("🛑 Bot stopping (KeyboardInterrupt).")
 
-        # Clean shutdown
+        # Graceful shutdown
         for w in workers:
             try:
                 w.close()
-            except Exception:
+            except:
                 pass
 
-        # Allow closing WS threads
-        time.sleep(1.0)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
