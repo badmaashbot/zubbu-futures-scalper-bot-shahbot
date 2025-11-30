@@ -660,25 +660,17 @@ class DecisionEngine:
             f"📌 ENTRY | {symbol}\nSide: {side}\nEntry: {fill_price}\nTP: {tp}\nSL: {sl}"
         )
 # ================================================================
-# MARKET WORKER (STABLE L2 + TRADES, NO RECONNECT SPAM)
+# MARKET WORKER (MANUAL WS, STABLE, NON-FREEZING, AUTO-PING)
 # ================================================================
-
-# Safer WS settings (overrides older values above)
-WS_SILENCE_SEC = 20.0      # we only log if silent; no forced close
-STALE_OB_MAX_SEC = 8.0     # orderbook can be slightly old before we skip
 
 class MarketWorker(threading.Thread):
     """
-    - Connects to Bybit public WS v5 (mainnet or testnet)
-    - Subscribes to:
-         orderbook.25.<SYMBOL>
-         publicTrade.<SYMBOL>
-    - Maintains:
-         Level-2 orderbook
-         Trades buffer
-         1s & 5s candles
-         Price timeline
-    - Periodically calls DecisionEngine.evaluate() for this symbol
+    Handles Bybit Public WS (orderbook + trades) for one symbol.
+    Stable manual websocket with:
+      - ping every 10s
+      - silent timeout 25s
+      - reconnect on any error
+      - clean recv loop (no freeze)
     """
 
     def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool = True):
@@ -687,115 +679,128 @@ class MarketWorker(threading.Thread):
         self.engine = engine
         self.exchange = exchange
         self.testnet = testnet
-        
-        # IMPORTANT: PUBLIC_WS_MAINNET / TESTNET must be:
-        #   wss://stream.bybit.com/v5/public
-        #   wss://stream-testnet.bybit.com/v5/public
+
+        # Correct endpoints
         self.ws_url = PUBLIC_WS_TESTNET if testnet else PUBLIC_WS_MAINNET
+
+        # Topics
         self.topic_ob = f"orderbook.1.{symbol}"
         self.topic_trade = f"publicTrade.{symbol}"
 
-        self.ws: Optional[websocket.WebSocketApp] = None
+        # socket holder
+        self.ws = None
         self._stop = threading.Event()
 
-        # L2 orderbook
-        self.book: Dict[str, Dict[float, float]] = {"bids": {}, "asks": {}}
-        self.last_ob_ts: float = 0.0
+        # local orderbook + buffers
+        self.book = {"bids": {}, "asks": {}}
+        self.last_ob_ts = 0.0
 
-        # Trades + prices
-        self.trades: deque = deque(maxlen=1000)
-        self.prices: deque = deque(maxlen=1000)
+        self.trades = deque(maxlen=1000)
+        self.prices = deque(maxlen=1000)
 
-        # Candles
-        self.c1: List[Dict[str, Any]] = []
-        self.c5: List[Dict[str, Any]] = []
+        self.c1 = []
+        self.c5 = []
 
-        # Eval timing
-        self.last_eval: float = 0.0
-        self.last_msg_ts: float = now_ts()
+        self.last_msg_ts = now_ts()
+        self.last_eval = 0.0
 
     # ------------------------------------------------------------
-    # WEBSOCKET CALLBACKS
+    # CONNECT (NON-BLOCKING, MANUAL)
     # ------------------------------------------------------------
-    def on_open(self, ws):
-        logger.info(f"{self.symbol}: WS opened.")
-        try:
-            sub = {"op": "subscribe", "args": [self.topic_ob, self.topic_trade]}
-            ws.send(json.dumps(sub))
-            logger.info(f"{self.symbol}: subscribed to L2 + trades")
-        except Exception as e:
-            logger.error(f"{self.symbol}: subscribe error: {e}")
+    def connect(self):
+        backoff = 1
 
+        while not self._stop.is_set():
+            try:
+                logger.info(f"{self.symbol}: Opening WS socket…")
+                self.ws = websocket.create_connection(self.ws_url, timeout=10)
+
+                # subscribe
+                sub = {"op": "subscribe", "args": [self.topic_ob, self.topic_trade]}
+                self.ws.send(json.dumps(sub))
+                logger.info(f"{self.symbol}: subscribed to L2 + trades")
+                return
+
+            except Exception as e:
+                logger.warning(f"{self.symbol}: Connect failed: {e}, retrying in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 16)
+
+    # ------------------------------------------------------------
+    # MAIN RUN LOOP (MANUAL RECV + PING + TIMEOUT)
+    # ------------------------------------------------------------
+    def run(self):
+
+        # open connection first
+        self.connect()
+
+        PING_INTERVAL = 10
+        SILENT_MAX = 25
+
+        last_ping = time.time()
+        last_msg = time.time()
+
+        while not self._stop.is_set():
+            try:
+                # receive
+                msg = self.ws.recv()
+
+                if msg:
+                    last_msg = time.time()
+                    self.on_message(self.ws, msg)
+
+                # send ping
+                if time.time() - last_ping >= PING_INTERVAL:
+                    try:
+                        self.ws.send(json.dumps({"op": "ping"}))
+                        logger.info(f"{self.symbol}: → PING")
+                    except:
+                        logger.warning(f"{self.symbol}: ping failed → reconnecting")
+                        raise Exception("Ping failed")
+                    last_ping = time.time()
+
+                # silent timeout
+                if time.time() - last_msg >= SILENT_MAX:
+                    logger.warning(f"{self.symbol}: WS silent {SILENT_MAX}s → reconnecting")
+                    raise Exception("Silent timeout")
+
+                # evaluate
+                self.maybe_eval()
+
+            except Exception as e:
+                logger.warning(f"{self.symbol}: WS error: {e}")
+                try:
+                    self.ws.close()
+                except:
+                    pass
+                time.sleep(1)
+                self.connect()
+
+    # ------------------------------------------------------------
+    # CALLBACK: on_message
+    # ------------------------------------------------------------
     def on_message(self, ws, message: str):
         self.last_msg_ts = now_ts()
         try:
             msg = json.loads(message)
-        except Exception:
+        except:
             return
 
         try:
             topic = msg.get("topic", "")
+
             if topic.startswith("orderbook"):
                 self.handle_ob(msg)
             elif topic.startswith("publicTrade"):
                 self.handle_trades(msg)
+
         except Exception as e:
             logger.exception(f"{self.symbol}: on_message error: {e}")
 
-    def on_error(self, ws, error):
-        logger.error(f"{self.symbol}: WS error: {error}")
-
-    def on_close(self, ws, code, msg):
-        logger.warning(f"{self.symbol}: WS closed: {code} {msg}")
-
-    def run(self):
-
-    Open connection
-    self.connect()
-
-    PING_INTERVAL = 10
-    SILENT_MAX = 25
-
-    last_ping = time.time()
-    last_msg = time.time()
-
-    while not self._stop.is_set():
-        try:
-            # ---- receive message ----
-            msg = self.ws.recv()
-
-            if msg:
-                last_msg = time.time()
-                self.on_message(self.ws, msg)
-
-            # ---- send ping ----
-            if time.time() - last_ping >= PING_INTERVAL:
-                try:
-                    self.ws.send(json.dumps({"op": "ping"}))
-                    logger.info(f"{self.symbol}: → PING")
-                except:
-                    logger.warning(f"{self.symbol}: ping failed, reconnecting")
-                    raise Exception("Ping failed")
-                last_ping = time.time()
-
-            # ---- silent watchdog ----
-            if time.time() - last_msg >= SILENT_MAX:
-                logger.warning(f"{self.symbol}: WS silent {SILENT_MAX}s → reconnecting")
-                raise Exception("Silent timeout")
-
-        except Exception as e:
-            logger.warning(f"{self.symbol}: WS error: {e}")
-            try:
-                self.ws.close()
-            except:
-                pass
-            time.sleep(1)
-            self.connect()
-
     # ------------------------------------------------------------
-    # ORDERBOOK HANDLER (SNAPSHOT + DELTA)
+    # ORDERBOOK HANDLER
     # ------------------------------------------------------------
-    def handle_ob(self, msg: Dict[str, Any]) -> None:
+    def handle_ob(self, msg: Dict[str, Any]):
         try:
             data = msg.get("data")
             if not data:
@@ -825,7 +830,7 @@ class MarketWorker(threading.Thread):
             else:
                 self.last_ob_ts = float(item.get("ts", now_ts()))
 
-                def apply_side(lst, side: str):
+                def upd(lst, side):
                     bookside = self.book["bids"] if side == "buy" else self.book["asks"]
                     for x in lst:
                         p, q = float(x[0]), float(x[1])
@@ -838,11 +843,11 @@ class MarketWorker(threading.Thread):
                     part = item.get(key)
                     if isinstance(part, dict):
                         if "bids" in part:
-                            apply_side(part["bids"], "buy")
+                            upd(part["bids"], "buy")
                         if "asks" in part:
-                            apply_side(part["asks"], "sell")
+                            upd(part["asks"], "sell")
 
-            # update mid-price history
+            # mid price
             if self.book["bids"] and self.book["asks"]:
                 best_bid = max(self.book["bids"])
                 best_ask = min(self.book["asks"])
@@ -855,19 +860,20 @@ class MarketWorker(threading.Thread):
     # ------------------------------------------------------------
     # TRADES HANDLER
     # ------------------------------------------------------------
-    def handle_trades(self, msg: Dict[str, Any]) -> None:
+    def handle_trades(self, msg: Dict[str, Any]):
         try:
             data = msg.get("data")
             if not data:
                 return
+
             arr = data if isinstance(data, list) else [data]
 
-            for item in arr:
-                price = float(item.get("price") or item.get("p", 0.0))
-                size = float(item.get("size") or item.get("q", 0.0))
-                side = (item.get("side") or "buy").lower()
+            for t in arr:
+                price = float(t.get("price") or t.get("p", 0.0))
+                size = float(t.get("size") or t.get("q", 0.0))
+                side = (t.get("side") or "buy").lower()
 
-                ts = float(item.get("ts") or item.get("trade_time_ms") or now_ts())
+                ts = float(t.get("ts") or t.get("trade_time_ms") or now_ts())
                 if ts > 1e12:
                     ts /= 1000.0
 
