@@ -717,7 +717,7 @@ class MarketWorker(threading.Thread):
 
         self.ws_url = PUBLIC_WS_TESTNET if testnet else PUBLIC_WS_MAINNET
         self.topic_ob = f"orderbook.25.{symbol}"
-        self.topic_trade = f"trade.{symbol}"
+        self.topic_trade = f"publicTrade.{symbol}"
 
         self.ws: Optional[websocket.WebSocketApp] = None
         self._stop = threading.Event()
@@ -766,7 +766,7 @@ class MarketWorker(threading.Thread):
             # Trade messages may come with "topic":"trade.BTCUSDT" and "data":[{...}, ...]
             if isinstance(msg, dict) and ("topic" in msg and msg.get("topic", "").startswith("orderbook")):
                 self.handle_ob(msg)
-            elif isinstance(msg, dict) and ("topic" in msg and msg.get("topic", "").startswith("trade")):
+            elif isinstance(msg, dict) and ("topic" in msg and msg.get("topic", "").startswith("publicTrade")):
                 self.handle_trades(msg)
             else:
                 # ignore other messages (info/pong)
