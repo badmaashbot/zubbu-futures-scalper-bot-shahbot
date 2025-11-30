@@ -692,7 +692,7 @@ class MarketWorker(threading.Thread):
         #   wss://stream.bybit.com/v5/public
         #   wss://stream-testnet.bybit.com/v5/public
         self.ws_url = PUBLIC_WS_TESTNET if testnet else PUBLIC_WS_MAINNET
-        self.topic_ob = f"orderbook.25.{symbol}"
+        self.topic_ob = f"orderbook.1.{symbol}"
         self.topic_trade = f"publicTrade.{symbol}"
 
         self.ws: Optional[websocket.WebSocketApp] = None
