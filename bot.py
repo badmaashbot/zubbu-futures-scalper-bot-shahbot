@@ -748,44 +748,49 @@ class MarketWorker(threading.Thread):
     def on_close(self, ws, code, msg):
         logger.warning(f"{self.symbol}: WS closed: {code} {msg}")
 
-    # ------------------------------------------------------------
-    # CONNECT / RECONNECT LOOP (BACKOFF, NO FORCE CLOSE)
-    # ------------------------------------------------------------
-    def connect(self):
-        backoff = 1
+    def run(self):
 
-        while not self._stop.is_set():
-            try:
-                self.ws = websocket.WebSocketApp(
-                    self.ws_url,
-                    on_open=self.on_open,
-                    on_message=self.on_message,
-                    on_error=self.on_error,
-                    on_close=self.on_close,
-                )
+    # 1) Open connection
+    self.connect()
 
-                logger.info(f"{self.symbol}: WS connecting...")
-                # run_forever blocks until socket really closes or error
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as e:
-                logger.error(f"{self.symbol}: WS crash: {e}")
+    PING_INTERVAL = 10
+    SILENT_MAX = 25
 
-            if self._stop.is_set():
-                break
+    last_ping = time.time()
+    last_msg = time.time()
 
-            logger.warning(f"{self.symbol}: WS reconnecting in {backoff}s")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 16)  # exponential backoff
-
-        logger.info(f"{self.symbol}: connect() loop exit")
-
-    def close(self):
-        self._stop.set()
+    while not self._stop.is_set():
         try:
-            if self.ws:
+            # ---- receive message ----
+            msg = self.ws.recv()
+
+            if msg:
+                last_msg = time.time()
+                self.on_message(self.ws, msg)
+
+            # ---- send ping ----
+            if time.time() - last_ping >= PING_INTERVAL:
+                try:
+                    self.ws.send(json.dumps({"op": "ping"}))
+                    logger.info(f"{self.symbol}: → PING")
+                except:
+                    logger.warning(f"{self.symbol}: ping failed, reconnecting")
+                    raise Exception("Ping failed")
+                last_ping = time.time()
+
+            # ---- silent watchdog ----
+            if time.time() - last_msg >= SILENT_MAX:
+                logger.warning(f"{self.symbol}: WS silent {SILENT_MAX}s → reconnecting")
+                raise Exception("Silent timeout")
+
+        except Exception as e:
+            logger.warning(f"{self.symbol}: WS error: {e}")
+            try:
                 self.ws.close()
-        except Exception:
-            pass
+            except:
+                pass
+            time.sleep(1)
+            self.connect()
 
     # ------------------------------------------------------------
     # ORDERBOOK HANDLER (SNAPSHOT + DELTA)
