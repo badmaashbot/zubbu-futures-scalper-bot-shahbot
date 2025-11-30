@@ -1,3 +1,4 @@
+cat > bot.py << 'EOF'
 #!/usr/bin/env python3
 """
 Bybit-USDT linear – cannot-lose-the-book micro-scalper
@@ -111,8 +112,7 @@ class Book:
             asks=np.array(sorted(((float(k),float(v)) for k,v in self.asks.items())
                                  )[:SNAP_DEPTH], dtype=np.double)
         return bids, asks
-
-# ----------  EXCHANGE  ----------
+        # ----------  EXCHANGE  ----------
 class Exchange:
     def __init__(self):
         cfg={"apiKey":API_KEY,"secret":API_SECRET,"enableRateLimit":True,
@@ -284,3 +284,4 @@ if __name__=="__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("shutdown")
+EOF
