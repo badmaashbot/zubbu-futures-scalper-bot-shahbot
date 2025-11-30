@@ -694,7 +694,7 @@ class MarketWorker(threading.Thread):
         last_ping = time.time()
         last_msg_time = time.time()
 
-        while not self.stop_flag:
+    while not self.stop_flag:
             try:
                 msg = self.ws.recv()
 
