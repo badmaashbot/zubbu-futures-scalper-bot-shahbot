@@ -305,14 +305,14 @@ class WS(threading.Thread):
         uvloop.install()
         asyncio.run(self._run())
 
-    async def _run(self):
-        while not self._stop.is_set():
-            try:
-                await self._one_loop()
-            except Exception as e:
-                log.error("%s WS crash %s – reconnect in 1 s", self.sym, e)
-                await asyncio.sleep(1)
-
+async def _run(self):
+    while not self._stop.is_set():
+        try:
+            await self._one_loop()
+        except Exception as e:
+            log.error("%s WS crash %s – reconnect in 1 s", self.sym, e)
+            await asyncio.sleep(1)
+            
     async def _one_loop(self):
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(self.url, heartbeat=10) as ws:
