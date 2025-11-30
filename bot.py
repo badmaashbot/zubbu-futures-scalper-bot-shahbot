@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Bybit-USDT linear – **cannot-lose-the-book** micro-scalper
-Fixed: 95 % equity × 3 × leverage, 1 % TP-equity, 0.5 % SL-equity
-Author: fixed-for-you
-"""
 import os, sys, time, json, logging, asyncio, threading, zlib, decimal
 from collections import deque
 from typing import Dict, List, Optional, Tuple
