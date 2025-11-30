@@ -38,7 +38,7 @@ CCXT_SYMBOL_MAP = {
 }
 
 PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public"
-PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public"
+PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public"
 
 SCAN_INTERVAL = 4.0      # FASTER scanning for more scalps
 LEVERAGE = 3
