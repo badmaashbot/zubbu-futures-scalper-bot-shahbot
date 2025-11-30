@@ -34,6 +34,7 @@ if not API_KEY or not API_SECRET:
 
 # WebSocket symbols (Bybit format)
 SYMBOLS_WS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
+ws_ready = {}
 
 # ccxt unified symbols for USDT perpetual
 SYMBOL_MAP = {
@@ -59,7 +60,7 @@ BURST_THRESH = 0.15
 MAX_SPREAD = 0.0004        # 0.04%
 MIN_RANGE_PCT = 0.001      # 0.1% minimal micro-range
 RECENT_TRADE_WINDOW = 0.15 # 150 ms window to measure burst
-BOOK_STALE_SEC = 2.0       # ignore book older than 2s
+BOOK_STALE_SEC = 6.0       # ignore book older than 2s
 
 KILL_SWITCH_DD = 0.05      # 5% equity drawdown -> stop trading
 HEARTBEAT_IDLE_SEC = 1800  # 30 minutes idle heartbeat
@@ -552,54 +553,75 @@ class ScalperBot:
         )
 
 
-# --------------- WEBSOCKET LOOP -----------------
-
+# ------------------ WEBSOCKET LOOP ------------------
 
 async def ws_loop(mkt: MarketState):
     """
     One WS connection, multiple topics: orderbook.1 + publicTrade for all 5 symbols.
     Updates MarketState in real-time.
     """
-    topics: List[str] = []
+
+    topics = []
     for s in SYMBOLS_WS:
         topics.append(f"orderbook.1.{s}")
     for s in SYMBOLS_WS:
         topics.append(f"publicTrade.{s}")
 
+    global ws_ready
+    # ws_ready = {} must exist at top of file
+
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(WS_URL, heartbeat=10) as ws:
+
+                    # Subscribe to all topics
                     sub = {"op": "subscribe", "args": topics}
                     await ws.send_json(sub)
-                    await send_telegram("🔌 WS connected & subscribed.")
+
+                    # Send "WS Connected" alert ONLY once per each symbol
+                    for sym in SYMBOLS_WS:
+                        if not ws_ready.get(sym, False):
+                            await send_telegram(f"📡 {sym} WS connected & subscribed.")
+                            ws_ready[sym] = True
+
+                    # --- Main WS message loop ---
                     async for msg in ws:
+
+                        # ---------------- TEXT MESSAGE ----------------
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             topic = data.get("topic")
                             if not topic:
                                 continue
+
+                            # -------- ORDERBOOK --------
                             if topic.startswith("orderbook"):
                                 sym = topic.split(".")[-1]
-                                payload = (
-                                    data["data"][0]
-                                    if isinstance(data.get("data"), list)
-                                    else data.get("data")
-                                )
+
+                                payload = data.get("data")
+                                if isinstance(payload, list):
+                                    payload = payload[0]
+
                                 if payload:
                                     mkt.update_book(sym, payload)
+
+                            # -------- TRADES --------
                             elif topic.startswith("publicTrade"):
                                 sym = topic.split(".")[-1]
-                                arr = (
-                                    data["data"]
-                                    if isinstance(data.get("data"), list)
-                                    else [data.get("data")]
-                                )
+
+                                payload = data.get("data")
+                                if isinstance(payload, list):
+                                    trades = payload
+                                else:
+                                    trades = [payload]
+
                                 now = time.time()
-                                for t in arr:
+                                for t in trades:
                                     price = float(t.get("p") or t.get("price"))
                                     qty = float(t.get("q") or t.get("size"))
                                     side = (t.get("S") or t.get("side") or "Buy").lower()
+
                                     mkt.add_trade(
                                         sym,
                                         {
@@ -609,11 +631,14 @@ async def ws_loop(mkt: MarketState):
                                             "ts": now,
                                         },
                                     )
+
+                        # ---------------- ERROR MESSAGE ----------------
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
-        except Exception:
-            # reconnect after small delay
-            await asyncio.sleep(1.0)
+
+        except Exception as e:
+            log.warning("WS crashed, reconnecting in 1s: %s", e)
+            await asyncio.sleep(1)
 
 
 # --------------- MAIN LOOP -----------------
