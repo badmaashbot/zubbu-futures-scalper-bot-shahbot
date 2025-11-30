@@ -37,8 +37,8 @@ CCXT_SYMBOL_MAP = {
     "DOGEUSDT": "DOGE/USDT:USDT",
 }
 
-PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public/linear"
-PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public/linear"
+PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public"
+PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public"
 
 SCAN_INTERVAL = 4.0      # FASTER scanning for more scalps
 LEVERAGE = 3
@@ -660,25 +660,25 @@ class DecisionEngine:
             f"📌 ENTRY | {symbol}\nSide: {side}\nEntry: {fill_price}\nTP: {tp}\nSL: {sl}"
         )
 # ================================================================
-# MARKET WORKER (FIXED — STABLE WEBSOCKET + L2 FEED)
+# MARKET WORKER (STABLE L2 + TRADES, NO RECONNECT SPAM)
 # ================================================================
 
-# Recommended safer WS settings
-WS_SILENCE_SEC = 8.0       # was 3.0 — prevents over-reconnect spam
-STALE_OB_MAX_SEC = 5.0     # was 2.0 — safer on slow networks
+# Safer WS settings (overrides older values above)
+WS_SILENCE_SEC = 20.0      # we only log if silent; no forced close
+STALE_OB_MAX_SEC = 8.0     # orderbook can be slightly old before we skip
 
 class MarketWorker(threading.Thread):
     """
     - Connects to Bybit public WS v5 (mainnet or testnet)
     - Subscribes to:
-         orderbook.25.<symbol>
-         publicTrade.<symbol>
-    - Keeps:
+         orderbook.25.<SYMBOL>
+         publicTrade.<SYMBOL>
+    - Maintains:
          Level-2 orderbook
-         Trades
-         1s + 5s candles
+         Trades buffer
+         1s & 5s candles
          Price timeline
-    - Calls DecisionEngine.evaluate() safely
+    - Periodically calls DecisionEngine.evaluate() for this symbol
     """
 
     def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool = True):
@@ -688,6 +688,9 @@ class MarketWorker(threading.Thread):
         self.exchange = exchange
         self.testnet = testnet
 
+        # IMPORTANT: PUBLIC_WS_MAINNET / TESTNET must be:
+        #   wss://stream.bybit.com/v5/public
+        #   wss://stream-testnet.bybit.com/v5/public
         self.ws_url = PUBLIC_WS_TESTNET if testnet else PUBLIC_WS_MAINNET
         self.topic_ob = f"orderbook.25.{symbol}"
         self.topic_trade = f"publicTrade.{symbol}"
@@ -695,18 +698,21 @@ class MarketWorker(threading.Thread):
         self.ws: Optional[websocket.WebSocketApp] = None
         self._stop = threading.Event()
 
-        self.book = {"bids": {}, "asks": {}}
-        self.last_ob_ts = 0.0
+        # L2 orderbook
+        self.book: Dict[str, Dict[float, float]] = {"bids": {}, "asks": {}}
+        self.last_ob_ts: float = 0.0
 
-        self.trades = deque(maxlen=1000)
-        self.prices = deque(maxlen=1000)
+        # Trades + prices
+        self.trades: deque = deque(maxlen=1000)
+        self.prices: deque = deque(maxlen=1000)
 
-        self.c1 = []
-        self.c5 = []
+        # Candles
+        self.c1: List[Dict[str, Any]] = []
+        self.c5: List[Dict[str, Any]] = []
 
-        self.last_eval = 0.0
-
-        self.last_msg_ts = now_ts()
+        # Eval timing
+        self.last_eval: float = 0.0
+        self.last_msg_ts: float = now_ts()
 
     # ------------------------------------------------------------
     # WEBSOCKET CALLBACKS
@@ -724,7 +730,7 @@ class MarketWorker(threading.Thread):
         self.last_msg_ts = now_ts()
         try:
             msg = json.loads(message)
-        except:
+        except Exception:
             return
 
         try:
@@ -734,7 +740,7 @@ class MarketWorker(threading.Thread):
             elif topic.startswith("publicTrade"):
                 self.handle_trades(msg)
         except Exception as e:
-            logger.exception(f"{self.symbol}: msg error: {e}")
+            logger.exception(f"{self.symbol}: on_message error: {e}")
 
     def on_error(self, ws, error):
         logger.error(f"{self.symbol}: WS error: {error}")
@@ -743,22 +749,23 @@ class MarketWorker(threading.Thread):
         logger.warning(f"{self.symbol}: WS closed: {code} {msg}")
 
     # ------------------------------------------------------------
-    # CONNECT / RECONNECT LOOP (NO SPAM)
+    # CONNECT / RECONNECT LOOP (BACKOFF, NO FORCE CLOSE)
     # ------------------------------------------------------------
     def connect(self):
-        self.ws = websocket.WebSocketApp(
-            self.ws_url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
-        )
-
         backoff = 1
 
         while not self._stop.is_set():
             try:
+                self.ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_open=self.on_open,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                )
+
                 logger.info(f"{self.symbol}: WS connecting...")
+                # run_forever blocks until socket really closes or error
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logger.error(f"{self.symbol}: WS crash: {e}")
@@ -768,22 +775,22 @@ class MarketWorker(threading.Thread):
 
             logger.warning(f"{self.symbol}: WS reconnecting in {backoff}s")
             time.sleep(backoff)
+            backoff = min(backoff * 2, 16)  # exponential backoff
 
-            # exponential but capped
-            backoff = min(backoff * 2, 8)
+        logger.info(f"{self.symbol}: connect() loop exit")
 
     def close(self):
         self._stop.set()
         try:
             if self.ws:
                 self.ws.close()
-        except:
+        except Exception:
             pass
 
     # ------------------------------------------------------------
-    # ORDERBOOK HANDLER
+    # ORDERBOOK HANDLER (SNAPSHOT + DELTA)
     # ------------------------------------------------------------
-    def handle_ob(self, msg):
+    def handle_ob(self, msg: Dict[str, Any]) -> None:
         try:
             data = msg.get("data")
             if not data:
@@ -792,49 +799,50 @@ class MarketWorker(threading.Thread):
             item = data[0] if isinstance(data, list) else data
             typ = msg.get("type") or item.get("type", "")
 
-            # SNAPSHOT
+            # snapshot
             if typ == "snapshot" or ("bids" in item and "asks" in item):
                 self.book["bids"].clear()
                 self.book["asks"].clear()
 
-                for p, q in item.get("bids", []):
-                    p = float(p); q = float(q)
+                for b in item.get("bids", []):
+                    p, q = float(b[0]), float(b[1])
                     if q > 0:
                         self.book["bids"][p] = q
 
-                for p, q in item.get("asks", []):
-                    p = float(p); q = float(q)
+                for a in item.get("asks", []):
+                    p, q = float(a[0]), float(a[1])
                     if q > 0:
                         self.book["asks"][p] = q
 
                 self.last_ob_ts = float(item.get("ts", now_ts()))
 
-                if self.book["bids"] and self.book["asks"]:
-                    mid = (max(self.book["bids"]) + min(self.book["asks"])) / 2
-                    self.prices.append((now_ts(), mid))
-
-            # DELTA
+            # delta
             else:
                 self.last_ob_ts = float(item.get("ts", now_ts()))
 
-                def apply(lst, side):
+                def apply_side(lst, side: str):
                     bookside = self.book["bids"] if side == "buy" else self.book["asks"]
-                    for p, q in lst:
-                        p = float(p); q = float(q)
+                    for x in lst:
+                        p, q = float(x[0]), float(x[1])
                         if q <= 0:
                             bookside.pop(p, None)
                         else:
                             bookside[p] = q
 
-                for k in ("delete", "update", "insert"):
-                    part = item.get(k)
+                for key in ("delete", "update", "insert"):
+                    part = item.get(key)
                     if isinstance(part, dict):
-                        if "bids" in part: apply(part["bids"], "buy")
-                        if "asks" in part: apply(part["asks"], "sell")
+                        if "bids" in part:
+                            apply_side(part["bids"], "buy")
+                        if "asks" in part:
+                            apply_side(part["asks"], "sell")
 
-                if self.book["bids"] and self.book["asks"]:
-                    mid = (max(self.book["bids"]) + min(self.book["asks"])) / 2
-                    self.prices.append((now_ts(), mid))
+            # update mid-price history
+            if self.book["bids"] and self.book["asks"]:
+                best_bid = max(self.book["bids"])
+                best_ask = min(self.book["asks"])
+                mid = (best_bid + best_ask) / 2.0
+                self.prices.append((now_ts(), mid))
 
         except Exception as e:
             logger.exception(f"{self.symbol}: OB error: {e}")
@@ -842,17 +850,16 @@ class MarketWorker(threading.Thread):
     # ------------------------------------------------------------
     # TRADES HANDLER
     # ------------------------------------------------------------
-    def handle_trades(self, msg):
+    def handle_trades(self, msg: Dict[str, Any]) -> None:
         try:
-            arr = msg.get("data")
-            if not arr:
+            data = msg.get("data")
+            if not data:
                 return
-            if not isinstance(arr, list):
-                arr = [arr]
+            arr = data if isinstance(data, list) else [data]
 
             for item in arr:
-                price = float(item.get("price") or item.get("p", 0))
-                size = float(item.get("size") or item.get("q", 0))
+                price = float(item.get("price") or item.get("p", 0.0))
+                size = float(item.get("size") or item.get("q", 0.0))
                 side = (item.get("side") or "buy").lower()
 
                 ts = float(item.get("ts") or item.get("trade_time_ms") or now_ts())
@@ -860,7 +867,6 @@ class MarketWorker(threading.Thread):
                     ts /= 1000.0
 
                 self.trades.append({"ts": ts, "price": price, "size": size, "side": side})
-
                 self.prices.append((now_ts(), price))
 
             self.update_candles()
@@ -869,16 +875,16 @@ class MarketWorker(threading.Thread):
             logger.exception(f"{self.symbol}: trades error: {e}")
 
     # ------------------------------------------------------------
-    # CANDLES
+    # CANDLE BUILDER (1s + 5s)
     # ------------------------------------------------------------
-    def update_candles(self):
+    def update_candles(self) -> None:
         try:
             if not self.trades:
                 return
 
-            trades = list(self.trades)
             now = now_ts()
-            c1_map = {}
+            trades = list(self.trades)
+            c1_map: Dict[int, Dict[str, Any]] = {}
 
             for t in trades:
                 sec = int(t["ts"])
@@ -895,24 +901,25 @@ class MarketWorker(threading.Thread):
                         "volume": t["size"],
                     }
                 else:
-                    c1_map[sec]["high"] = max(c1_map[sec]["high"], t["price"])
-                    c1_map[sec]["low"] = min(c1_map[sec]["low"], t["price"])
-                    c1_map[sec]["close"] = t["price"]
-                    c1_map[sec]["volume"] += t["size"]
+                    c = c1_map[sec]
+                    c["high"] = max(c["high"], t["price"])
+                    c["low"] = min(c["low"], t["price"])
+                    c["close"] = t["price"]
+                    c["volume"] += t["size"]
 
             self.c1 = [c1_map[k] for k in sorted(c1_map)][-60:]
 
-            # Build 5s candles
-            c5_map = {}
+            c5_map: Dict[int, Dict[str, Any]] = {}
             for c in self.c1:
                 bucket = (c["ts"] // 5) * 5
                 if bucket not in c5_map:
-                    c5_map[bucket] = c.copy()
+                    c5_map[bucket] = dict(c)
                 else:
-                    c5_map[bucket]["high"] = max(c5_map[bucket]["high"], c["high"])
-                    c5_map[bucket]["low"] = min(c5_map[bucket]["low"], c["low"])
-                    c5_map[bucket]["close"] = c["close"]
-                    c5_map[bucket]["volume"] += c["volume"]
+                    agg = c5_map[bucket]
+                    agg["high"] = max(agg["high"], c["high"])
+                    agg["low"] = min(agg["low"], c["low"])
+                    agg["close"] = c["close"]
+                    agg["volume"] += c["volume"]
 
             self.c5 = [c5_map[k] for k in sorted(c5_map)][-60:]
 
@@ -920,9 +927,9 @@ class MarketWorker(threading.Thread):
             logger.exception(f"{self.symbol}: candle error: {e}")
 
     # ------------------------------------------------------------
-    # EVALUATION LOOP
+    # EVALUATION THROTTLE
     # ------------------------------------------------------------
-    def maybe_eval(self):
+    def maybe_eval(self) -> None:
         try:
             now = now_ts()
             if now - self.last_eval < SCAN_INTERVAL:
@@ -951,28 +958,20 @@ class MarketWorker(threading.Thread):
             logger.exception(f"{self.symbol}: eval error: {e}")
 
     # ------------------------------------------------------------
-    # MAIN RUN LOOP (NO RECONNECT SPAM)
+    # MAIN RUN LOOP
     # ------------------------------------------------------------
-    def run(self):
+    def run(self) -> None:
+        # Start WS in background thread
         th = threading.Thread(target=self.connect, daemon=True)
         th.start()
 
         try:
             while not self._stop.is_set():
-
-                # if WS silent too long → reconnect 1 time
+                # Only log if WS quiet; no forced close (avoids NoneType sock + spam)
                 if now_ts() - self.last_msg_ts > WS_SILENCE_SEC:
-                    logger.warning(f"{self.symbol}: WS silent → reconnect")
-                    try:
-                        if self.ws:
-                            self.ws.close()
-                    except:
-                        pass
-
-                    # 🔥 IMPORTANT: reset timer to avoid spam loop
+                    logger.warning(f"{self.symbol}: WS silent for {WS_SILENCE_SEC}s (no force reconnect)")
+                    # reset timer so we don't log every 0.2s
                     self.last_msg_ts = now_ts()
-
-                    time.sleep(1)
 
                 self.maybe_eval()
                 time.sleep(0.2)
@@ -981,6 +980,8 @@ class MarketWorker(threading.Thread):
             logger.exception(f"{self.symbol}: worker crash: {e}")
         finally:
             self.close()
+
+
 # ================================================================
 # MAIN
 # ================================================================
@@ -991,16 +992,16 @@ def main() -> None:
     logger.info("Starting Bybit scalper bot…")
     tg("🟢 Bot started")
 
-    # Start 10-minute heartbeat
+    # Heartbeat every 10 minutes
     start_heartbeat()
 
     # Exchange client
     exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
 
-    # Clear leftover positions
+    # Close any leftover positions from previous run
     emergency_close_all(exchange, SYMBOLS)
 
-    # Get starting equity for kill-switch
+    # Kill-switch starting equity
     try:
         STARTING_EQUITY = exchange.get_balance()
     except Exception as e:
@@ -1026,33 +1027,30 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"{s}: leverage set failed: {e}")
 
-    # Decision engine (brain)
+    # Decision engine (shared brain)
     engine = DecisionEngine(exchange, SYMBOLS)
 
-    # Start workers (WS + L2 + evaluate)
-    workers = []
+    # Start workers: one WS + L2 + eval per symbol
+    workers: List[MarketWorker] = []
     for s in SYMBOLS:
         w = MarketWorker(s, engine, exchange, TESTNET)
         w.start()
         workers.append(w)
 
-    logger.info("Workers started. Bot running…")
+    logger.info("Workers started. Bot running… (Ctrl+C to stop)")
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(1.0)
     except KeyboardInterrupt:
         logger.info("Stopping workers…")
         tg("🛑 Bot stopping (KeyboardInterrupt).")
-
-        # Graceful shutdown
         for w in workers:
             try:
                 w.close()
-            except:
+            except Exception:
                 pass
-
-        time.sleep(1)
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":
