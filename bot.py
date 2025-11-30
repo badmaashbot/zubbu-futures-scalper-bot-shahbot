@@ -688,39 +688,6 @@ class MarketWorker(threading.Thread):
         self.exchange = exchange
         self.testnet = testnet
         
-                PING_INTERVAL = 10        # send ping every 10 sec
-        SILENT_MAX = 25           # if no messages for 25 sec, force reconnect
-
-        last_ping = time.time()
-        last_msg_time = time.time()
-
-        while not self.stop_flag:
-            try:
-                msg = self.ws.recv()
-
-                # If message received
-                if msg:
-                    last_msg_time = time.time()
-                    self.process_message(msg)
-
-                # ---- PING every 10 sec ----
-                if time.time() - last_ping >= PING_INTERVAL:
-                    try:
-                        self.ws.send(json.dumps({"op": "ping"}))
-                        logging.info(f"{self.symbol}: → PING")
-                    except Exception as e:
-                        logging.warning(f"{self.symbol}: Ping failed: {e}")
-                    last_ping = time.time()
-
-                # ---- FORCE RECONNECT if silent ----
-                if time.time() - last_msg_time >= SILENT_MAX:
-                    logging.warning(f"{self.symbol}: WS silent for {SILENT_MAX}s → forcing reconnect")
-                    raise Exception("WS silent")
-
-            except Exception as e:
-                logging.warning(f"{self.symbol}: WS error → {e}")
-                break
-
         # IMPORTANT: PUBLIC_WS_MAINNET / TESTNET must be:
         #   wss://stream.bybit.com/v5/public
         #   wss://stream-testnet.bybit.com/v5/public
