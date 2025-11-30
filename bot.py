@@ -14,7 +14,7 @@ import websocket
 import requests
 
 # ================================================================
-# CONFIG
+# CONFIG (UPDATED)
 # ================================================================
 
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -26,6 +26,7 @@ if not API_KEY or not API_SECRET:
 # True = testnet, False = live
 TESTNET = os.getenv("BYBIT_TESTNET", "0") in ("1", "true", "True")
 
+# Symbols
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
 
 CCXT_SYMBOL_MAP = {
@@ -39,35 +40,36 @@ CCXT_SYMBOL_MAP = {
 PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public/linear"
 PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public/linear"
 
-SCAN_INTERVAL = 5.0               # seconds between decision scans
+SCAN_INTERVAL = 4.0      # FASTER scanning for more scalps
 LEVERAGE = 3
 MARGIN_FRACTION = 0.95
 
-TP_PCT_ON_POSITION = 0.01         # 1% TP
-SL_PCT_ON_POSITION = 0.005        # 0.5% SL
+TP_PCT_ON_POSITION = 0.01    # 1% TP
+SL_PCT_ON_POSITION = 0.005   # 0.5% SL
 
-GLOBAL_KILL_TRIGGER = 0.05        # 5% equity loss
+GLOBAL_KILL_TRIGGER = 0.05   # 5% equity loss kill switch
 STARTING_EQUITY: Optional[float] = None
 bot_killed: bool = False
-kill_alert_sent: bool = False     # only one Telegram alert for kill-switch
+kill_alert_sent: bool = False
 
 MAX_CONCURRENT_POSITIONS = 1
 
-POST_ONLY_TIMEOUT = 3.0
-VOL_MOVE_PCT_1S = 0.004
-VOL_MOVE_PCT_3S = 0.008
+POST_ONLY_TIMEOUT = 2.5
 
-IMBALANCE_LEVELS = 5
-IMBALANCE_THRESHOLD = 0.05
+# RELAXED FILTERS (as you requested)
+MICRO_DELTA_THRESHOLD = 0.02
+MICRO_BURST_THRESHOLD = 0.15
+VOL_MOVE_PCT_1S = 0.006      # relaxed unpredictability
+VOL_MOVE_PCT_3S = 0.012
+IMBALANCE_THRESHOLD = 0.03
+SPREAD_MAX_PCT = 0.0015
+MIN_CANDLE_VOLATILITY = 0.0015
 
-STALE_OB_MAX_SEC = 2.0
-LATENCY_MAX_SEC = 1.5
 MIN_SL_DIST_PCT = 0.0005
 MIN_TRADE_INTERVAL_SEC = 5.0
-SPREAD_MAX_PCT = 0.001
-ERROR_PAUSE_SEC = 10.0
+ERROR_PAUSE_SEC = 8.0
+STALE_OB_MAX_SEC = 2.0
 
-# WebSocket safety: if no messages for this many seconds, treat as dead
 WS_SILENCE_SEC = 3.0
 
 logging.basicConfig(
@@ -76,13 +78,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scalper_bot")
 
-
 def now_ts() -> float:
     return time.time()
 
-
 # ================================================================
-# TELEGRAM (NO SPAM)
+# TELEGRAM (unchanged, safe)
 # ================================================================
 
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
@@ -96,15 +96,7 @@ TELEGRAM_MIN_INTERVAL_SEC = 10.0
 TELEGRAM_DUP_SUPPRESS_SEC = 30.0
 TELEGRAM_HTTP_TIMEOUT = 3.0
 
-
 def tg(msg: str) -> None:
-    """
-    Telegram helper:
-    - Skips if no token/chat.
-    - Rate-limited.
-    - Duplicate-suppressed.
-    - Never crashes the bot.
-    """
     global _last_tg_time, _last_tg_text, _last_tg_text_time
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -126,23 +118,20 @@ def tg(msg: str) -> None:
         _last_tg_text = msg
         _last_tg_text_time = now
     except Exception as e:
-        logger.warning(f"Telegram send failed: {e}")
-
+        logger.warning(f"Telegram Error: {e}")
 
 # ================================================================
-# HEARTBEAT (EVERY 10 MIN)
+# HEARTBEAT
 # ================================================================
 
-def heartbeat_loop() -> None:
+def heartbeat_loop():
     while True:
         tg("💓 Bot running (heartbeat)")
-        time.sleep(600)  # 10 minutes
+        time.sleep(600)
 
-
-def start_heartbeat() -> None:
+def start_heartbeat():
     t = threading.Thread(target=heartbeat_loop, daemon=True)
     t.start()
-
 
 # ================================================================
 # POSITION STRUCT
@@ -158,8 +147,6 @@ class Position:
     sl_price: float
     notional: float
     ts_open: float = field(default_factory=now_ts)
-
-
 # ================================================================
 # PnL & POSITION SIZING
 # ================================================================
@@ -176,6 +163,7 @@ def compute_position_and_prices(
     entry_price: float,
     side: str,
 ) -> Tuple[float, float, float, float]:
+
     if equity_usd <= 0 or entry_price <= 0:
         return 0.0, 0.0, 0.0, 0.0
 
@@ -183,23 +171,23 @@ def compute_position_and_prices(
     qty = notional / entry_price
     qty = float(f"{qty:.6f}")
 
+    # TP/SL based on side
     if side == "buy":
-        tp = entry_price * (1.0 + TP_PCT_ON_POSITION)
-        sl = entry_price * (1.0 - SL_PCT_ON_POSITION)
+        tp = entry_price * (1 + TP_PCT_ON_POSITION)
+        sl = entry_price * (1 - SL_PCT_ON_POSITION)
     else:
-        tp = entry_price * (1.0 - TP_PCT_ON_POSITION)
-        sl = entry_price * (1.0 + SL_PCT_ON_POSITION)
+        tp = entry_price * (1 - TP_PCT_ON_POSITION)
+        sl = entry_price * (1 + SL_PCT_ON_POSITION)
 
     return qty, notional, tp, sl
 
-
 # ================================================================
-# EXCHANGE CLIENT
+# EXCHANGE CLIENT (unchanged)
 # ================================================================
 
 class ExchangeClient:
     def __init__(self, key: str, secret: str, testnet: bool = True):
-        cfg: Dict[str, Any] = {
+        cfg = {
             "apiKey": key,
             "secret": secret,
             "enableRateLimit": True,
@@ -212,6 +200,7 @@ class ExchangeClient:
                     "private": "https://api-testnet.bybit.com",
                 }
             }
+
         self.client = ccxt.bybit(cfg)
         self.lock = threading.Lock()
 
@@ -224,40 +213,34 @@ class ExchangeClient:
         usdt = bal.get("USDT", {})
         return float(usdt.get("total", 0.0))
 
-    def set_leverage(self, symbol: str, lev: int) -> None:
+    def set_leverage(self, symbol: str, lev: int):
         try:
             with self.lock:
                 self.client.set_leverage(lev, self._sym(symbol))
         except Exception as e:
-            logger.warning(f"{symbol}: leverage set failed: {e}")
+            logger.warning(f"{symbol}: Failed to set leverage: {e}")
 
-    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def get_position(self, symbol: str):
         try:
             with self.lock:
                 p = self.client.fetch_positions([self._sym(symbol)])
         except Exception as e:
             logger.warning(f"{symbol}: fetch_positions error: {e}")
             return None
+
         for x in p:
             size = float(x.get("contracts") or 0.0)
             if size != 0:
                 return x
         return None
 
-    def place_limit(
-        self,
-        symbol: str,
-        side: str,
-        price: float,
-        qty: float,
-        reduce: bool = False,
-        post: bool = True,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {}
+    def place_limit(self, symbol, side, price, qty, reduce=False, post=True):
+        params = {}
         if reduce:
             params["reduce_only"] = True
         if post:
             params["timeInForce"] = "PostOnly"
+
         with self.lock:
             return self.client.create_order(
                 self._sym(symbol),
@@ -268,39 +251,11 @@ class ExchangeClient:
                 params,
             )
 
-    def place_market(
-        self,
-        symbol: str,
-        side: str,
-        qty: float,
-        reduce: bool = False,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {}
+    def place_market(self, symbol, side, qty, reduce=False):
+        params = {}
         if reduce:
             params["reduce_only"] = True
-        with self.lock:
-            # price must be None for market orders in ccxt
-            return self.client.create_order(
-                self._sym(symbol),
-                "market",
-                side.lower(),
-                qty,
-                None,
-                params,
-            )
 
-    def place_stop_market(
-        self,
-        symbol: str,
-        side: str,
-        qty: float,
-        stop_price: float,
-    ) -> Dict[str, Any]:
-        # Bybit stop-loss via ccxt: market with stopLossPrice param
-        params: Dict[str, Any] = {
-            "stopLossPrice": stop_price,
-            "reduce_only": True,
-        }
         with self.lock:
             return self.client.create_order(
                 self._sym(symbol),
@@ -311,39 +266,55 @@ class ExchangeClient:
                 params,
             )
 
-    def order_status(self, symbol: str, oid: Optional[str]) -> Dict[str, Any]:
+    def place_stop_market(self, symbol, side, qty, stop_price):
+        params = {"stopLossPrice": stop_price, "reduce_only": True}
+        with self.lock:
+            return self.client.create_order(
+                self._sym(symbol),
+                "market",
+                side.lower(),
+                qty,
+                None,
+                params,
+            )
+
+    def order_status(self, symbol, oid):
         if not oid:
             return {}
         try:
             with self.lock:
                 o = self.client.fetch_order(oid, self._sym(symbol))
+
             return {
                 "status": (o.get("status") or "").lower(),
                 "avg_price": o.get("average") or o.get("price"),
                 "amount": o.get("amount"),
             }
         except Exception as e:
-            logger.warning(f"{symbol}: fetch_order error: {e}")
+            logger.warning(f"{symbol}: order_status error: {e}")
             return {}
 
-    def cancel(self, symbol: str, oid: str) -> bool:
+    def cancel(self, symbol, oid):
         try:
             with self.lock:
                 self.client.cancel_order(oid, self._sym(symbol))
             return True
         except Exception as e:
-            logger.warning(f"{symbol}: cancel_order error: {e}")
+            logger.warning(f"{symbol}: cancel error: {e}")
             return False
 
-    def close_market(self, symbol: str) -> None:
+    def close_market(self, symbol):
         p = self.get_position(symbol)
         if not p:
             return
+
         size = float(p.get("contracts") or 0.0)
         if size == 0:
             return
+
         side = (p.get("side") or "").lower()
         close_side = "sell" if side == "long" else "buy"
+
         with self.lock:
             try:
                 self.client.create_order(
@@ -354,142 +325,84 @@ class ExchangeClient:
                     None,
                     {"reduce_only": True},
                 )
-                logger.warning(f"{symbol}: emergency market close size={size}")
+                logger.warning(f"{symbol}: emergency close {size}")
             except Exception as e:
-                logger.error(f"{symbol}: emergency close failed: {e}")
-
+                logger.error(f"{symbol}: emergency close FAILED: {e}")
 
 # ================================================================
 # EMERGENCY CLOSE ALL
 # ================================================================
 
-def emergency_close_all(exchange: ExchangeClient, symbols: List[str]) -> None:
+def emergency_close_all(exchange: ExchangeClient, symbols: List[str]):
     for s in symbols:
         try:
             exchange.close_market(s)
         except Exception as e:
             logger.error(f"{s}: emergency close error: {e}")
 
-
 # ================================================================
-# SPOOF / WHALE DETECTORS
-# ================================================================
-
-class SpoofDetector:
-    def __init__(self, window: float = 1.0, repeat: int = 3):
-        self.window = window
-        self.repeat = repeat
-        self.data: Dict[Tuple[str, float], deque] = defaultdict(deque)
-
-    def on_event(self, side: str, price: float, etype: str, ts: float) -> None:
-        k = (side, float(price))
-        dq = self.data[k]
-        dq.append((etype, ts))
-        while dq and ts - dq[0][1] > self.window:
-            dq.popleft()
-
-    def check(self, side: str, price: float) -> bool:
-        dq = self.data.get((side, float(price)), deque())
-        cancels = sum(1 for x, _ in dq if x == "cancel")
-        return cancels >= self.repeat
-
-
-class WhaleCancelDetector:
-    def __init__(self, th: float, window: float = 5.0):
-        self.th = th
-        self.window = window
-        self.data: Dict[float, deque] = defaultdict(deque)
-
-    def on_event(self, price: float, size: float, etype: str, ts: float) -> None:
-        if size < self.th:
-            return
-        dq = self.data[float(price)]
-        dq.append((etype, ts, size))
-        while dq and ts - dq[0][1] > self.window:
-            dq.popleft()
-
-    def check(self, price: float) -> bool:
-        dq = self.data.get(float(price), deque())
-        if not dq:
-            return False
-        cancels = sum(1 for t, _, _ in dq if t == "cancel")
-        adds = sum(1 for t, _, _ in dq if t == "new")
-        if adds + cancels == 0:
-            return False
-        return (cancels / (adds + cancels)) > 0.3
-
-
-# ================================================================
-# MICRO FILTER HELPERS
+# MICRO FILTER HELPERS (UPDATED & RELAXED)
 # ================================================================
 
-def compute_imbalance(book: Dict[str, Dict[float, float]]) -> float:
-    bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:IMBALANCE_LEVELS]
-    asks = sorted(book["asks"].items(), key=lambda x: x[0])[:IMBALANCE_LEVELS]
+def compute_imbalance(book):
+    bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
+    asks = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
     bv = sum(q for _, q in bids)
     av = sum(q for _, q in asks)
     tot = bv + av
     if tot == 0:
-        return 0.0
+        return 0
     return (bv - av) / tot
 
 
-def micro_delta(book: Dict[str, Dict[float, float]]) -> float:
+def micro_delta(book):
     bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:2]
     asks = sorted(book["asks"].items(), key=lambda x: x[0])[:2]
     bv = sum(q for _, q in bids)
     av = sum(q for _, q in asks)
-    if bv + av == 0:
-        return 0.0
-    return (bv - av) / (bv + av)
+    tot = bv + av
+    if tot == 0:
+        return 0
+    return (bv - av) / tot
 
 
-def micro_burst(trades: List[Dict[str, Any]], window_sec: float = 0.15) -> float:
+def micro_burst(trades, window_sec=0.15):
     if not trades:
-        return 0.0
+        return 0
     now = trades[-1]["ts"]
-    b = 0.0
+    b = 0
     for t in reversed(trades):
         if now - t["ts"] > window_sec:
             break
-        if t["side"] == "buy":
-            b += t["size"]
-        else:
-            b -= t["size"]
+        b += t["size"] if t["side"] == "buy" else -t["size"]
     return b
 
 
-def liquidity_gap(book: Dict[str, Dict[float, float]], th: float = 0.15) -> bool:
-    bids = sum(x for _, x in sorted(book["bids"].items(), reverse=True)[:5])
-    asks = sum(x for _, x in sorted(book["asks"].items())[:5])
-    if bids == 0 or asks == 0:
-        return True
-    return bids < th * asks or asks < th * bids
-
-
-def unpredictable(prices: List[Tuple[float, float]]) -> bool:
+def unpredictable(prices):
     if len(prices) < 3:
         return False
+
     t0, p0 = prices[-1]
     p1s = None
     p3s = None
+
     for ts, p in reversed(prices):
         dt = t0 - ts
-        if p1s is None and dt >= 1.0:
+        if p1s is None and dt >= 1:
             p1s = p
-        if p3s is None and dt >= 3.0:
+        if p3s is None and dt >= 3:
             p3s = p
         if p1s and p3s:
             break
+
     if p1s and abs(p0 - p1s) / p1s >= VOL_MOVE_PCT_1S:
         return True
     if p3s and abs(p0 - p3s) / p3s >= VOL_MOVE_PCT_3S:
         return True
+
     return False
-
-
 # ================================================================
-# DECISION ENGINE
+# DECISION ENGINE (UPDATED WITH NEW FILTERS)
 # ================================================================
 
 class DecisionEngine:
@@ -497,19 +410,19 @@ class DecisionEngine:
         self.exchange = exchange
         self.symbols = symbols
         self.open_positions: Dict[str, Position] = {}
-        self.spoof = SpoofDetector()
-        self.whale = {s: WhaleCancelDetector(1.0) for s in symbols}
+
         self.pause_until = 0.0
         self.last_trade_ts = 0.0
         self.lock = threading.Lock()
 
-    def pause(self, sec: float) -> None:
+    # ------------------------------------------------------------
+    def pause(self, sec: float):
         self.pause_until = max(self.pause_until, now_ts() + sec)
-        logger.warning(f"Engine paused for {sec:.1f}s")
 
     def is_paused(self) -> bool:
         return now_ts() < self.pause_until
 
+    # ------------------------------------------------------------
     def check_kill(self, equity: float) -> bool:
         global STARTING_EQUITY, bot_killed, kill_alert_sent
 
@@ -518,63 +431,50 @@ class DecisionEngine:
 
         if STARTING_EQUITY is None:
             STARTING_EQUITY = equity
-            logger.info(f"Recorded STARTING_EQUITY={STARTING_EQUITY:.4f}")
             return False
 
-        loss_pct = (STARTING_EQUITY - equity) / STARTING_EQUITY if STARTING_EQUITY > 0 else 0.0
+        if STARTING_EQUITY <= 0:
+            return False
+
+        loss_pct = (STARTING_EQUITY - equity) / STARTING_EQUITY
         if loss_pct >= GLOBAL_KILL_TRIGGER:
             bot_killed = True
+
             if not kill_alert_sent:
-                tg(f"❌ GLOBAL KILL SWITCH TRIGGERED\nEquity loss={loss_pct*100:.2f}%")
+                tg(f"❌ GLOBAL KILL SWITCH\nLoss = {loss_pct*100:.2f}%")
                 kill_alert_sent = True
-            logger.error("Global kill-switch active, closing all positions & pausing.")
+
             emergency_close_all(self.exchange, self.symbols)
             self.pause(99999999)
             return True
 
         return False
 
-    def on_close(self, symbol: str, exit_price: float) -> None:
+    # ------------------------------------------------------------
+    def on_close(self, symbol: str, exit_price: float):
         pos = self.open_positions.get(symbol)
         if not pos:
             return
+
         del self.open_positions[symbol]
-
-        dist_tp = abs(exit_price - pos.tp_price)
-        dist_sl = abs(exit_price - pos.sl_price)
-        hit = "TP" if dist_tp < dist_sl else "SL"
-
         pnl = calc_pnl(pos.side, pos.entry_price, exit_price, pos.qty)
-        tg(f"📤 EXIT | {symbol}\nReason: {hit}\nPnL: {pnl} USDT")
+        tg(f"📤 EXIT | {symbol}\nPnL: {pnl} USDT")
 
-    def evaluate(
-        self,
-        symbol: str,
-        book: Dict[str, Dict[float, float]],
-        trades: List[Dict[str, Any]],
-        c5: List[Dict[str, Any]],
-        c1: List[Dict[str, Any]],
-        prices: List[Tuple[float, float]],
-        last_ob_ts: float,
-    ) -> None:
+    # ------------------------------------------------------------
+    def evaluate(self, symbol, book, trades, c5, c1, prices, last_ob_ts):
         with self.lock:
             self._evaluate_locked(symbol, book, trades, c5, c1, prices, last_ob_ts)
 
-    def _evaluate_locked(
-        self,
-        symbol: str,
-        book: Dict[str, Dict[float, float]],
-        trades: List[Dict[str, Any]],
-        c5: List[Dict[str, Any]],
-        c1: List[Dict[str, Any]],
-        prices: List[Tuple[float, float]],
-        last_ob_ts: float,
-    ) -> None:
+    # ------------------------------------------------------------
+    def _evaluate_locked(self, symbol, book, trades, c5, c1, prices, last_ob_ts):
         now = now_ts()
+
+        # ---------------------------
+        # Balance
+        # ---------------------------
         try:
             equity = self.exchange.get_balance()
-        except Exception as e:
-            logger.warning(f"{symbol}: failed to fetch balance: {e}")
+        except:
             return
 
         if self.check_kill(equity):
@@ -583,129 +483,196 @@ class DecisionEngine:
         if self.is_paused():
             return
 
-        if self.last_trade_ts and (now - self.last_trade_ts) < MIN_TRADE_INTERVAL_SEC:
+        if now - self.last_trade_ts < MIN_TRADE_INTERVAL_SEC:
             return
 
         if now - last_ob_ts > STALE_OB_MAX_SEC:
-            logger.warning(f"{symbol}: stale orderbook, pausing briefly.")
-            self.pause(2.0)
+            self.pause(2)
             return
 
         if unpredictable(prices):
-            logger.warning(f"{symbol}: unpredictable micro-move, short pause.")
-            self.pause(5.0)
+            self.pause(4)
             return
 
-        if len(c1) < 5 or len(trades) < 10:
+        if len(c1) < 20 or len(trades) < 10:
             return
 
         last = c1[-1]
         rng = last["high"] - last["low"]
-        if last["close"] == 0:
-            return
-        if (rng / last["close"]) < 0.002:
+        if rng <= 0 or last["close"] <= 0:
             return
 
-        bids = book["bids"]
-        asks = book["asks"]
-        if not bids or not asks:
+        # --------------------------------------------
+        # Minimum volatility (loosened)
+        # --------------------------------------------
+        if (rng / last["close"]) < 0.0010:
             return
 
-        best_bid = max(bids)
-        best_ask = min(asks)
-        mid = (best_bid + best_ask) / 2.0
+        # --------------------------------------------
+        # Orderbook
+        # --------------------------------------------
+        if not book["bids"] or not book["asks"]:
+            return
+
+        best_bid = max(book["bids"])
+        best_ask = min(book["asks"])
+        mid = (best_bid + best_ask) / 2
         spread = (best_ask - best_bid) / mid
+
         if spread > SPREAD_MAX_PCT:
             return
 
+        # --------------------------------------------
+        # L2 MICRO FILTERS (LOOSENED)
+        # --------------------------------------------
         md = micro_delta(book)
-        if abs(md) < 0.05:
+        if abs(md) < 0.02:   # was 0.05
             return
 
         tb = micro_burst(trades)
-        if abs(tb) < 0.5:
-            return
-
-        if liquidity_gap(book):
+        if abs(tb) < 0.15:   # was 0.5
             return
 
         imb = compute_imbalance(book)
-        if abs(imb) < IMBALANCE_THRESHOLD:
+        if abs(imb) < 0.03:  # was 0.05
             return
 
-        if self.spoof.check("bid", best_bid) or self.spoof.check("ask", best_ask):
-            return
-        if self.whale[symbol].check(best_bid):
+        # --------------------------------------------
+        # RANGE DETECTOR (NEW)
+        # --------------------------------------------
+        # 1) Bollinger width small → market dead
+        closes = [x["close"] for x in c1[-20:]]
+        mean = sum(closes) / 20
+        variance = sum((c - mean) ** 2 for c in closes) / 20
+        stdev = variance ** 0.5
+
+        upper = mean + (2 * stdev)
+        lower = mean - (2 * stdev)
+        boll_width_pct = (upper - lower) / mean
+
+        if boll_width_pct < 0.0035:  # 0.35%
+            return  # range, avoid trading
+
+        # 2) Price stuck in 20s range
+        last_20_high = max(x["high"] for x in c1[-20:])
+        last_20_low = min(x["low"] for x in c1[-20:])
+        if (last_20_high - last_20_low) / mid < 0.0020:
             return
 
-        direction = 1 if tb > 0 else -1
-        side = "Buy" if direction == 1 else "Sell"
+        # --------------------------------------------
+        # EMA Trend Filter (20/50)
+        # --------------------------------------------
+        if len(c1) >= 50:
+            closes = [x["close"] for x in c1]
+            ema20 = sum(closes[-20:]) / 20
+            ema50 = sum(closes[-50:]) / 50
+
+            uptrend = ema20 > ema50
+            downtrend = ema20 < ema50
+
+            if tb > 0 and not uptrend:
+                return
+            if tb < 0 and not downtrend:
+                return
+
+        # --------------------------------------------
+        # Volume spike (safety)
+        # --------------------------------------------
+        last_vol = last["volume"]
+        avg_vol = sum(x["volume"] for x in c1[-10:]) / 10
+
+        if last_vol < 1.3 * avg_vol:
+            return
+
+        # --------------------------------------------
+        # Bollinger confirmation (NEW)
+        # --------------------------------------------
+        # bounce or break logic
+        price = last["close"]
+
+        if tb > 0 and price < lower:    # bullish bounce from lower band
+            pass
+        elif tb < 0 and price > upper:  # bearish rejection near upper band
+            pass
+        else:
+            # small wiggle inside → ignore
+            return
+
+        # --------------------------------------------
+        # Final Side
+        # --------------------------------------------
+        side = "Buy" if tb > 0 else "Sell"
 
         qty, notional, tp, sl = compute_position_and_prices(equity, mid, side.lower())
-        if qty <= 0 or notional <= 0:
+
+        if qty <= 0:
             return
 
         sl_dist = abs(mid - sl) / mid
         if sl_dist < MIN_SL_DIST_PCT:
             return
 
-        # ENTRY
+        # --------------------------------------------
+        # ENTRY ORDER
+        # --------------------------------------------
         try:
-            entry = self.exchange.place_limit(symbol, side, mid, qty, reduce=False, post=True)
+            entry = self.exchange.place_limit(symbol, side, mid, qty, post=True)
             oid = entry.get("id")
-            start_t = now_ts()
             filled = False
             fill_price = mid
+            stime = now_ts()
 
-            while now_ts() - start_t < POST_ONLY_TIMEOUT:
+            while now_ts() - stime < POST_ONLY_TIMEOUT:
                 st = self.exchange.order_status(symbol, oid)
-                status = st.get("status", "")
-                if status in ("closed", "filled"):
+                if st.get("status") in ("closed", "filled"):
                     filled = True
-                    fill_price = float(st.get("avg_price", mid) or mid)
+                    fill_price = float(st.get("avg_price") or fill_price)
                     break
                 time.sleep(0.1)
 
             if not filled:
-                if oid:
-                    self.exchange.cancel(symbol, oid)
-                mkt = self.exchange.place_market(symbol, side, qty, reduce=False)
-                fill_price = float(mkt.get("average", mid) or mid)
+                self.exchange.cancel(symbol, oid)
+                mkt = self.exchange.place_market(symbol, side, qty)
+                fill_price = float(mkt.get("average") or fill_price)
+
         except Exception as e:
-            logger.exception(f"{symbol}: entry failed: {e}")
-            tg(f"❌ Entry failed {symbol}: {e}")
-            self.pause(ERROR_PAUSE_SEC)
+            tg(f"❌ ENTRY FAILED {symbol}")
+            self.pause(3)
             return
 
-        # TP & SL
+        # --------------------------------------------
+        # TP / SL
+        # --------------------------------------------
+        reduce_side = "Sell" if side == "Buy" else "Buy"
+
         try:
-            reduce_side = "Sell" if side == "Buy" else "Buy"
             self.exchange.place_limit(symbol, reduce_side, tp, qty, reduce=True, post=False)
             self.exchange.place_stop_market(symbol, reduce_side, qty, sl)
-        except Exception as e:
-            logger.exception(f"{symbol}: TP/SL placement failed: {e}")
-            tg(f"❌ TP/SL failed {symbol}: {e}")
+        except Exception:
+            tg(f"❌ TP/SL FAIL {symbol}")
             self.exchange.close_market(symbol)
-            self.pause(ERROR_PAUSE_SEC)
             return
 
-        pos = Position(symbol, side, qty, fill_price, tp, sl, notional)
-        self.open_positions[symbol] = pos
+        self.open_positions[symbol] = Position(symbol, side, qty, fill_price, tp, sl, notional)
         self.last_trade_ts = now_ts()
-        tg(f"📌 ENTRY | {symbol}\nSide: {side}\nEntry: {fill_price}\nTP: {tp}\nSL: {sl}")
 
-
+        tg(
+            f"📌 ENTRY | {symbol}\nSide: {side}\nEntry: {fill_price}\nTP: {tp}\nSL: {sl}"
+        )
 # ================================================================
-# MARKET WORKER (FULL)
+# MARKET WORKER (WEBSOCKET + L2 DATA)
 # ================================================================
 
 class MarketWorker(threading.Thread):
     """
-    MarketWorker:
     - Connects to Bybit public websocket v5.
-    - Subscribes to orderbook.25.<SYMBOL> and trade.<SYMBOL>
-    - Maintains in-memory orderbook, trade buffer, 1s & 5s candles.
-    - Calls DecisionEngine.evaluate periodically (maybe_eval).
+    - Subscribes to orderbook.25.<SYMBOL> and publicTrade.<SYMBOL>
+    - Maintains:
+        * Level 2 orderbook
+        * Trades buffer
+        * 1s + 5s candles
+        * Price series for unpredictability checks
+    - Periodically calls DecisionEngine.evaluate()
     """
 
     def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool = True):
@@ -722,28 +689,29 @@ class MarketWorker(threading.Thread):
         self.ws: Optional[websocket.WebSocketApp] = None
         self._stop = threading.Event()
 
-        # book representation: price->size
+        # Orderbook: price -> size
         self.book: Dict[str, Dict[float, float]] = {"bids": {}, "asks": {}}
         self.last_ob_ts: float = 0.0
 
-        # trades buffer (deque of dicts with ts, price, size, side)
+        # Trades buffer
         self.trades: deque = deque(maxlen=1000)
 
-        # prices timeline for unpredictability checks: list of (ts, mid)
+        # Price series (for unpredictability)
         self.prices: deque = deque(maxlen=1000)
 
-        # candles
-        self.c1: List[Dict[str, Any]] = []
-        self.c5: List[Dict[str, Any]] = []
+        # Candles
+        self.c1: List[Dict[str, Any]] = []  # 1s
+        self.c5: List[Dict[str, Any]] = []  # 5s
 
-        # last eval timestamp
+        # Evaluation timing
         self.last_eval = 0.0
 
-        # for ws inactivity detection
+        # WS inactivity
         self.last_msg_ts = now_ts()
-
-    # Websocket callbacks
-    def on_open(self, ws) -> None:
+    # ------------------------------------------------------------
+    # WEBSOCKET CALLBACKS
+    # ------------------------------------------------------------
+    def on_open(self, ws):
         logger.info(f"{self.symbol}: WS opened, subscribing...")
         try:
             sub = {"op": "subscribe", "args": [self.topic_ob, self.topic_trade]}
@@ -752,36 +720,35 @@ class MarketWorker(threading.Thread):
         except Exception as e:
             logger.error(f"{self.symbol}: subscribe failed: {e}")
 
-    def on_message(self, ws, message: str) -> None:
+    def on_message(self, ws, message: str):
         self.last_msg_ts = now_ts()
         try:
             msg = json.loads(message)
         except Exception:
-            # Some servers may send ping/pong or plain strings
             return
 
-        # Bybit v5 sends {"topic": "..", "type": "snapshot"/"delta", "data": [...]} typical
         try:
-            topic = msg.get("topic") or msg.get("type") or ""
-            # Trade messages may come with "topic":"trade.BTCUSDT" and "data":[{...}, ...]
-            if isinstance(msg, dict) and ("topic" in msg and msg.get("topic", "").startswith("orderbook")):
+            topic = msg.get("topic") or ""
+            if topic.startswith("orderbook."):
                 self.handle_ob(msg)
-            elif isinstance(msg, dict) and ("topic" in msg and msg.get("topic", "").startswith("publicTrade")):
+            elif topic.startswith("publicTrade."):
                 self.handle_trades(msg)
             else:
-                # ignore other messages (info/pong)
+                # ignore non-data messages
                 pass
         except Exception as e:
-            logger.exception(f"{self.symbol}: on_message handling failed: {e}")
+            logger.exception(f"{self.symbol}: on_message error: {e}")
 
-    def on_error(self, ws, error) -> None:
+    def on_error(self, ws, error):
         logger.error(f"{self.symbol}: WS error: {error}")
 
-    def on_close(self, ws, close_status_code, close_msg) -> None:
-        logger.warning(f"{self.symbol}: WS closed: code={close_status_code} msg={close_msg}")
+    def on_close(self, ws, code, msg):
+        logger.warning(f"{self.symbol}: WS closed code={code} msg={msg}")
 
-    def connect(self) -> None:
-        # Create WebSocketApp
+    # ------------------------------------------------------------
+    # CONNECT / RECONNECT
+    # ------------------------------------------------------------
+    def connect(self):
         self.ws = websocket.WebSocketApp(
             self.ws_url,
             on_open=self.on_open,
@@ -789,18 +756,18 @@ class MarketWorker(threading.Thread):
             on_error=self.on_error,
             on_close=self.on_close,
         )
-        # Run in this thread (blocking) until stop/exception; reconnect on failures
+
         while not self._stop.is_set():
             try:
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logger.exception(f"{self.symbol}: run_forever exception: {e}")
-            # short backoff before reconnect
+
             if not self._stop.is_set():
-                logger.info(f"{self.symbol}: reconnecting websocket in 1s...")
+                logger.info(f"{self.symbol}: reconnecting WS in 1s...")
                 time.sleep(1.0)
 
-    def close(self) -> None:
+    def close(self):
         self._stop.set()
         try:
             if self.ws:
@@ -808,27 +775,27 @@ class MarketWorker(threading.Thread):
         except Exception:
             pass
 
-    # --- Orderbook handling (error-free) ---
-    def handle_ob(self, msg: Dict[str, Any]) -> None:
-        """
-        Parse orderbook snapshot and delta messages and update self.book.
-        Works with Bybit v5 'orderbook.25.SYMBOL' snapshot/delta structure.
-        """
+    # ------------------------------------------------------------
+    # ORDERBOOK HANDLER
+    # ------------------------------------------------------------
+    def handle_ob(self, msg: Dict[str, Any]):
         try:
             data = msg.get("data")
             if not data:
                 return
-            # data is usually a list with one item struct
+
             item = data[0] if isinstance(data, list) else data
             typ = msg.get("type") or item.get("type") or ""
 
-            # snapshot contains bids/asks arrays
-            if typ == "snapshot" or "bids" in item and "asks" in item:
+            # SNAPSHOT
+            if typ == "snapshot" or ("bids" in item and "asks" in item):
                 bids = item.get("bids", [])
                 asks = item.get("asks", [])
-                # bids/asks are lists of [price, size] or dicts
+
                 self.book["bids"].clear()
                 self.book["asks"].clear()
+
+                # BIDS
                 for b in bids:
                     if isinstance(b, (list, tuple)) and len(b) >= 2:
                         price = float(b[0])
@@ -840,6 +807,8 @@ class MarketWorker(threading.Thread):
                         continue
                     if size > 0:
                         self.book["bids"][price] = size
+
+                # ASKS
                 for a in asks:
                     if isinstance(a, (list, tuple)) and len(a) >= 2:
                         price = float(a[0])
@@ -854,7 +823,8 @@ class MarketWorker(threading.Thread):
 
                 ts = float(item.get("ts", now_ts()))
                 self.last_ob_ts = ts
-                # update price timeline
+
+                # mid price
                 try:
                     best_bid = max(self.book["bids"])
                     best_ask = min(self.book["asks"])
@@ -863,13 +833,13 @@ class MarketWorker(threading.Thread):
                 except Exception:
                     pass
 
-            elif typ == "delta" or "delete" in item or "update" in item or "insert" in item:
-                # delta messages may contain 'delete', 'update', 'insert' lists
+            # DELTA
+            elif typ == "delta" or any(k in item for k in ("delete", "update", "insert")):
                 ts = float(item.get("ts", now_ts()))
                 self.last_ob_ts = ts
 
-                # helper to apply changes
-                def apply_list(lst, side):
+                def apply_list(lst, side: str):
+                    book_side = self.book["bids"] if side == "buy" else self.book["asks"]
                     for entry in lst:
                         if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                             price = float(entry[0])
@@ -879,14 +849,12 @@ class MarketWorker(threading.Thread):
                             size = float(entry.get("size", 0.0))
                         else:
                             continue
-                        book_side = self.book["bids"] if side == "buy" else self.book["asks"]
                         if size <= 0:
                             if price in book_side:
                                 del book_side[price]
                         else:
                             book_side[price] = size
 
-                # Bybit delta keys can be 'delete','update','insert' with nested bids/asks
                 for k in ("delete", "update", "insert"):
                     parts = item.get(k, {})
                     if isinstance(parts, dict):
@@ -896,19 +864,11 @@ class MarketWorker(threading.Thread):
                             apply_list(bids, "buy")
                         if asks:
                             apply_list(asks, "sell")
-                    elif isinstance(parts, list):
-                        # sometimes it's a list of lists: [ [price,size], ... ]
-                        # assume it's bids or asks not specified - try to infer
-                        # try treating as bids first: update bids only
-                        for entry in parts:
-                            # can't know side, skip
-                            pass
 
-                # update price timeline if possible
                 try:
-                    best_bid = max(self.book["bids"]) if self.book["bids"] else 0.0
-                    best_ask = min(self.book["asks"]) if self.book["asks"] else 0.0
-                    if best_bid and best_ask:
+                    if self.book["bids"] and self.book["asks"]:
+                        best_bid = max(self.book["bids"])
+                        best_ask = min(self.book["asks"])
                         mid = (best_bid + best_ask) / 2.0
                         self.prices.append((now_ts(), mid))
                 except Exception:
@@ -917,75 +877,72 @@ class MarketWorker(threading.Thread):
         except Exception as e:
             logger.exception(f"{self.symbol}: handle_ob failed: {e}")
 
-    # --- Trade handling ---
-    def handle_trades(self, msg: Dict[str, Any]) -> None:
-        """
-        Parse trade messages and append to self.trades.
-        Bybit v5 trade msg usually has data: [ { "id", "price","size","side","ts" }, ... ]
-        """
+    # ------------------------------------------------------------
+    # TRADES HANDLER
+    # ------------------------------------------------------------
+    def handle_trades(self, msg: Dict[str, Any]):
         try:
             data = msg.get("data")
             if not data:
                 return
+
             arr = data if isinstance(data, list) else [data]
+
             for item in arr:
-                # item may be a dict with price,size,side,trade_time_ms/ts
                 price = float(item.get("price") or item.get("p") or 0.0)
                 size = float(item.get("size") or item.get("q") or item.get("qty") or 0.0)
-                side = (item.get("side") or item.get("s") or "").lower()
-                # normalize side values
-                if side in ("buy", "sell"):
-                    pass
-                elif side in ("b", "s", "buyer", "seller"):
-                    side = "buy" if "b" in side else "sell"
-                else:
-                    # fallback via price movement or leave unknown
+                side = (item.get("side") or item.get("S") or "").lower()
+
+                if side not in ("buy", "sell"):
                     side = "buy"
 
                 ts = float(item.get("ts") or item.get("trade_time_ms") or now_ts())
-                trade = {"ts": ts / 1000.0 if ts > 1e12 else ts, "price": price, "size": size, "side": side}
+                ts = ts / 1000.0 if ts > 1e12 else ts
+
+                trade = {"ts": ts, "price": price, "size": size, "side": side}
                 self.trades.append(trade)
-                # update price series
+
+                # also push to prices
                 try:
-                    # if we have a recent mid, append trade price as a mid substitute
                     self.prices.append((now_ts(), price))
                 except Exception:
                     pass
 
-            # update candles from trades
             self.update_candles()
+
         except Exception as e:
             logger.exception(f"{self.symbol}: handle_trades failed: {e}")
 
-    # --- Candle building ---
-    def update_candles(self) -> None:
-        """
-        Build / refresh 1s and 5s candles from self.trades.
-        Keep c1 (list of 1s candles) and c5 (list of 5s candles).
-        Candle structure: {"ts": ts_start, "open": , "high": , "low": , "close": , "volume": }
-        """
+    # ------------------------------------------------------------
+    # CANDLE BUILDER (1s and 5s)
+    # ------------------------------------------------------------
+    def update_candles(self):
         try:
             if not self.trades:
                 return
 
-            # Convert trades deque to list for processing
             trades = list(self.trades)
-            # Normalize timestamps to seconds (floats)
             for t in trades:
                 if t["ts"] > 1e12:
                     t["ts"] = t["ts"] / 1000.0
 
-            # Build 1s candles (last N seconds until now)
             now = now_ts()
-            # We will build up to last 60 1s candles
             c1_map: Dict[int, Dict[str, Any]] = {}
+
             for t in trades:
                 sec = int(t["ts"])
                 if sec < int(now) - 120:
                     continue
                 entry = c1_map.get(sec)
                 if not entry:
-                    c1_map[sec] = {"ts": sec, "open": t["price"], "high": t["price"], "low": t["price"], "close": t["price"], "volume": t["size"]}
+                    c1_map[sec] = {
+                        "ts": sec,
+                        "open": t["price"],
+                        "high": t["price"],
+                        "low": t["price"],
+                        "close": t["price"],
+                        "volume": t["size"],
+                    }
                 else:
                     entry["high"] = max(entry["high"], t["price"])
                     entry["low"] = min(entry["low"], t["price"])
@@ -993,17 +950,22 @@ class MarketWorker(threading.Thread):
                     entry["volume"] += t["size"]
 
             c1_list = [c1_map[k] for k in sorted(c1_map.keys())]
-            # keep last 60 seconds
             self.c1 = c1_list[-60:]
 
-            # Build 5s candles by aggregating 1s candles
+            # 5-second candles
             c5_map: Dict[int, Dict[str, Any]] = {}
             for c in self.c1:
-                # bucket by 5s
                 bucket = (c["ts"] // 5) * 5
                 entry = c5_map.get(bucket)
                 if not entry:
-                    c5_map[bucket] = {"ts": bucket, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]}
+                    c5_map[bucket] = {
+                        "ts": bucket,
+                        "open": c["open"],
+                        "high": c["high"],
+                        "low": c["low"],
+                        "close": c["close"],
+                        "volume": c["volume"],
+                    }
                 else:
                     entry["high"] = max(entry["high"], c["high"])
                     entry["low"] = min(entry["low"], c["low"])
@@ -1011,61 +973,68 @@ class MarketWorker(threading.Thread):
                     entry["volume"] += c["volume"]
 
             c5_list = [c5_map[k] for k in sorted(c5_map.keys())]
-            # keep last 60 5-second candles
             self.c5 = c5_list[-60:]
+
         except Exception as e:
             logger.exception(f"{self.symbol}: update_candles failed: {e}")
 
-    # --- maybe_eval: decide when to call engine.evaluate ---
-    def maybe_eval(self) -> None:
-        """
-        Called periodically by the worker loop. Throttles evaluate calls to SCAN_INTERVAL.
-        """
+    # ------------------------------------------------------------
+    # MAYBE EVALUATE (THROTTLED)
+    # ------------------------------------------------------------
+    def maybe_eval(self):
         try:
             now = now_ts()
-            if (now - self.last_eval) < SCAN_INTERVAL:
+            if now - self.last_eval < SCAN_INTERVAL:
                 return
-            # must have some data
-            if not self.book or (not self.book["bids"] and not self.book["asks"]):
+
+            if not self.book["bids"] and not self.book["asks"]:
                 return
-            # trades & candles required by decision engine
+
             trades_list = list(self.trades)
             prices_list = list(self.prices)
+
             self.update_candles()
-            # call engine.evaluate
+
             try:
-                self.engine.evaluate(self.symbol, self.book, trades_list, self.c5, self.c1, prices_list, self.last_ob_ts)
+                self.engine.evaluate(
+                    self.symbol,
+                    self.book,
+                    trades_list,
+                    self.c5,
+                    self.c1,
+                    prices_list,
+                    self.last_ob_ts,
+                )
             except Exception as e:
                 logger.exception(f"{self.symbol}: engine.evaluate error: {e}")
+
             self.last_eval = now
+
         except Exception as e:
             logger.exception(f"{self.symbol}: maybe_eval failed: {e}")
 
-    # --- main thread run ---
-    def run(self) -> None:
-        # Run the websocket connection in the current thread (blocking)
-        # but also periodically check for inactivity and call maybe_eval.
+    # ------------------------------------------------------------
+    # MAIN RUN LOOP
+    # ------------------------------------------------------------
+    def run(self):
         th = threading.Thread(target=self.connect, daemon=True)
         th.start()
 
-        # Monitor loop
         try:
             while not self._stop.is_set():
-                # if websocket silent for too long, try reconnect
+                # WS inactivity check
                 if now_ts() - self.last_msg_ts > WS_SILENCE_SEC:
-                    logger.warning(f"{self.symbol}: ws silence detected, reconnecting...")
+                    logger.warning(f"{self.symbol}: WS silence, reconnecting...")
                     try:
                         if self.ws:
                             self.ws.close()
                     except Exception:
                         pass
-                    # ensure connect thread will restart
                     time.sleep(1.0)
 
-                # run evaluation throttle & logic
                 self.maybe_eval()
-
                 time.sleep(0.2)
+
         except Exception as e:
             logger.exception(f"{self.symbol}: worker run failed: {e}")
         finally:
@@ -1073,8 +1042,6 @@ class MarketWorker(threading.Thread):
                 self.close()
             except Exception:
                 pass
-
-
 # ================================================================
 # MAIN
 # ================================================================
@@ -1082,54 +1049,72 @@ class MarketWorker(threading.Thread):
 def main() -> None:
     global STARTING_EQUITY, bot_killed, kill_alert_sent
 
-    logger.info("Starting Bybit scalper bot...")
+    logger.info("Starting Bybit scalper bot…")
     tg("🟢 Bot started")
 
+    # Start 10-minute heartbeat
     start_heartbeat()
 
+    # Exchange client
     exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
 
-    # Close any leftover positions from previous run
+    # Safety: close leftover positions before starting
     emergency_close_all(exchange, SYMBOLS)
 
+    # Fetch starting equity for kill switch
     try:
         STARTING_EQUITY = exchange.get_balance()
     except Exception as e:
         logger.warning(f"Failed to fetch starting equity: {e}")
         STARTING_EQUITY = 0.0
+
     bot_killed = False
     kill_alert_sent = False
 
-    logger.info(f"Kill-switch starting equity: {STARTING_EQUITY:.4f}, trigger={GLOBAL_KILL_TRIGGER*100:.1f}%")
-    tg(f"📊 Starting equity: {STARTING_EQUITY:.4f} USDT. Kill at {GLOBAL_KILL_TRIGGER*100:.1f}% loss.")
+    logger.info(
+        f"Kill-switch starting equity = {STARTING_EQUITY:.4f}, "
+        f"trigger = {GLOBAL_KILL_TRIGGER * 100:.1f}%"
+    )
+    tg(
+        f"📊 Starting equity: {STARTING_EQUITY:.4f} USDT\n"
+        f"Kill-switch at {GLOBAL_KILL_TRIGGER * 100:.1f}% loss."
+    )
 
+    # Set leverage for each symbol
     for s in SYMBOLS:
         try:
             exchange.set_leverage(s, LEVERAGE)
         except Exception as e:
             logger.warning(f"{s}: leverage set failed: {e}")
 
+    # Initialize decision engine
     engine = DecisionEngine(exchange, SYMBOLS)
-    workers: List[MarketWorker] = []
 
+    # Start a MarketWorker thread for each symbol
+    workers: List[MarketWorker] = []
     for s in SYMBOLS:
         w = MarketWorker(s, engine, exchange, TESTNET)
         w.start()
         workers.append(w)
 
-    logger.info("Workers started. Press Ctrl+C to stop.")
+    logger.info("Workers started. Bot is running. Press Ctrl+C to stop.")
+
+    # Main loop keeps the bot alive
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
-        logger.info("Stopping workers...")
+        logger.info("Stopping workers…")
         tg("🛑 Bot stopping (KeyboardInterrupt).")
+
+        # Clean shutdown
         for w in workers:
             try:
                 w.close()
             except Exception:
                 pass
-        # allow threads to exit gracefully
+
+        # Allow closing WS threads
         time.sleep(1.0)
 
 
