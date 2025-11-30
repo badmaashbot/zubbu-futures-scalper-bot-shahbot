@@ -37,8 +37,8 @@ CCXT_SYMBOL_MAP = {
     "DOGEUSDT": "DOGE/USDT:USDT",
 }
 
-PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public"
-PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public"
+PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public/linear"
+PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public/linear"
 
 SCAN_INTERVAL = 4.0      # FASTER scanning for more scalps
 LEVERAGE = 3
