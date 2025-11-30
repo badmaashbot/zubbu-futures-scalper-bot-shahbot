@@ -750,7 +750,7 @@ class MarketWorker(threading.Thread):
 
     def run(self):
 
-    # 1) Open connection
+    Open connection
     self.connect()
 
     PING_INTERVAL = 10
