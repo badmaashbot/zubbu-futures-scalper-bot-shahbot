@@ -302,18 +302,34 @@ class DecisionEngine:
 # ===============================================
 # MARKET WORKER
 # ===============================================
+# correct Bybit v5 WS endpoints
+PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public"
+PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public"
+
 class MarketWorker(threading.Thread):
-    def __init__(self, symbol, engine, ex):
-        super().__init__(daemon=True)
+    def init(self, symbol, engine, exchange, testnet=True):
+        super().init(daemon=True)
         self.symbol = symbol
         self.engine = engine
-        self.ex = ex
-        self.url = PUBLIC_WS_TESTNET if TESTNET else PUBLIC_WS_MAINNET
+        self.exchange = exchange
+        self.testnet = testnet
+
+        # FIXED WS URL
+        self.ws_url = PUBLIC_WS_TESTNET if testnet else PUBLIC_WS_MAINNET
+
+        # correct topics
         self.topic_ob = f"orderbook.1.{symbol}"
-        self.topic_tr = f"publicTrade.{symbol}"
+        self.topic_trd = f"publicTrade.{symbol}"
+
         self.book = {"bids": {}, "asks": {}}
-        self.trades = deque(maxlen=500)
-        self.last_ob_ts = 0
+        self.trades = deque(maxlen=1000)
+        self.prices = deque(maxlen=1000)
+        self.c1, self.c5 = [], []
+        self.last_ob_ts = 0.0
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._last_msg_ts = time.time()
+        self._last_eval_ts = 0.0
 
     def run(self):
         asyncio.run(self.main())
