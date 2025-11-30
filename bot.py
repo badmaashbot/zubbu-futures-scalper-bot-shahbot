@@ -48,20 +48,23 @@ prom_pos  = Gauge("pos_open", "Open positions")
 prom_pnl  = Gauge("pnl_usdt", "Unrealised PnL")
 prom_sig  = Counter("signals", "Signals", ["sym","side"])
 
-# ------------------------------------------------------------
-# TELEGRAM
-# ------------------------------------------------------------
+# -------------  Telegram  -------------
 _last_tg = 0
 async def tg(msg: str):
     global _last_tg
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    if time.time() - _last_tg < TELEGRAM_CD: return
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    if time.time() - _last_tg < TELEGRAM_CD:
+        return
     _last_tg = time.time()
     try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                         data={"chat_id": TG_CHAT_ID, "text": msg})
-    except: pass
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": TG_CHAT_ID, "text": msg}
+            )
+    except Exception as e:
+        log.warning("Telegram error: %s", e)
 
 # ------------------------------------------------------------
 # BOOK – always consistent
