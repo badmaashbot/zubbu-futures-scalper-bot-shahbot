@@ -418,40 +418,6 @@ class MarketState:
             "range_pct": rng,
         }
 
-# ================================================================
-# MOMENTUM, VOLATILITY & DYNAMIC TP MODULES
-# ================================================================
-
-def compute_momentum_score(imb, burst, spread):
-    """Higher score = stronger impulse."""
-    if spread <= 0:
-        spread = 0.000001
-    return abs(imb) * abs(burst) / spread
-
-
-class MoveAnalyzer:
-    """
-    Tracks recent impulse distances
-    and estimates typical TP length.
-    """
-    def __init__(self, max_samples=50):
-        self.moves = []
-        self.max_samples = max_samples
-
-    def add_move(self, distance_pct):
-        self.moves.append(distance_pct)
-        if len(self.moves) > self.max_samples:
-            self.moves.pop(0)
-
-    def avg_move(self):
-        if not self.moves:
-            return 0.006   # default 0.6%
-        return sum(self.moves) / len(self.moves)
-
-
-move_analyzer = MoveAnalyzer()
-
-
 def predict_volatility(trades_last_2s):
     """
     Simple volatility estimate using trade count + price range.
@@ -557,22 +523,21 @@ for sym in SYMBOLS_WS:
     if score < SCORE_MIN:
         continue
 
-            # basic filters
-            if spread <= 0 or spread > MAX_SPREAD:
-                continue
-            if abs(imb) < IMBALANCE_THRESH:
-                continue
-            if abs(burst) < BURST_THRESH:
-                continue
-            if rng < MIN_RANGE_PCT:
-                continue
+    # ----- BASIC FILTERS -----
+    if spread <= 0 or spread > MAX_SPREAD:
+        continue
+    if abs(imb) < IMBALANCE_THRESH:
+        continue
+    if abs(burst) < BURST_THRESH:
+        continue
+    if rng < MIN_RANGE_PCT:
+        continue
 
-            score = abs(imb) * abs(burst) / max(spread, 1e-6)
-
-            if score > best_score:
-                best_score = score
-                best_sym = sym
-                best_feat = feat
+    # choose best symbol
+    if score > best_score:
+        best_score = score
+        best_sym = sym
+        best_feat = feat
 
         if not best_sym or not best_feat:
             await self.maybe_heartbeat()
@@ -704,29 +669,29 @@ else:
         else:
             dd = (mid - pos.entry_price) / pos.entry_price
 
-if dd >= SL_PCT * 1.1:
+            if dd >= SL_PCT * 1.1:
 
-    # ❗ 1) CLOSE THE POSITION
-    await self.exchange.close_position_market(sym)
+                # CLOSE POSITION
+                await self.exchange.close_position_market(sym)
 
-    # ❗ 2) LOG MOVE LENGTH FOR DYNAMIC TP TRAINING
-    # dd = % move against us
-    move_pct = dd
-    move_analyzer.add_move(abs(move_pct))
+                # LOG MOVE LENGTH FOR DYNAMIC TP TRAINING
+                move_pct = dd
+                move_analyzer.add_move(abs(move_pct))
 
-    # ❗ 3) DEBUG + TELEGRAM
-    print(
-        f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-        f"now={mid:.4f} DD={dd*100:.2f}%"
-    )
-    await send_telegram(
-        f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-        f"now={mid:.4f} DD={dd*100:.2f}%"
-    )
+                # PRINT + TELEGRAM
+                print(
+                    f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                    f"now={mid:.4f} DD={dd*100:.2f}%"
+                )
+                await send_telegram(
+                    f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                    f"now={mid:.4f} DD={dd*100:.2f}%"
+                )
 
-    # ❗ 4) RESET POSITION
-    self.position = None
-    return
+                # CLEAR POSITION
+                self.position = None
+                return
+
 
     async def maybe_heartbeat(self):
         """
