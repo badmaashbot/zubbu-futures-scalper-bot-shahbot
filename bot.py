@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 import ccxt  # sync ccxt, we will wrap blocking calls with asyncio.to_thread
 
-
 # --------------- ENV / BASIC CONFIG -----------------
 
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -34,7 +33,7 @@ if not API_KEY or not API_SECRET:
 
 # WebSocket symbols (Bybit format)
 SYMBOLS_WS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
-ws_ready = {}
+ws_ready: Dict[str, bool] = {}
 
 # ccxt unified symbols for USDT perpetual
 SYMBOL_MAP = {
@@ -45,7 +44,11 @@ SYMBOL_MAP = {
     "DOGEUSDT": "DOGE/USDT:USDT",  # if ccxt version differs, adjust here
 }
 
-WS_URL = "wss://stream-testnet.bybit.com/v5/public/linear" if TESTNET else "wss://stream.bybit.com/v5/public/linear"
+WS_URL = (
+    "wss://stream-testnet.bybit.com/v5/public/linear"
+    if TESTNET
+    else "wss://stream.bybit.com/v5/public/linear"
+)
 
 # --------------- TRADING CONFIG -----------------
 
@@ -60,7 +63,7 @@ BURST_THRESH = 0.15
 MAX_SPREAD = 0.0004        # 0.04%
 MIN_RANGE_PCT = 0.001      # 0.1% minimal micro-range
 RECENT_TRADE_WINDOW = 0.15 # 150 ms window to measure burst
-BOOK_STALE_SEC = 6.0       # ignore book older than 2s
+BOOK_STALE_SEC = 6.0       # ignore book older than 6s
 
 KILL_SWITCH_DD = 0.05      # 5% equity drawdown -> stop trading
 HEARTBEAT_IDLE_SEC = 1800  # 30 minutes idle heartbeat
@@ -80,6 +83,10 @@ TG_MIN_INTERVAL = 5.0   # at most 1 msg every 5s
 
 
 async def send_telegram(msg: str):
+    """
+    Simple rate-limited Telegram sender.
+    Never raises errors (so TG can never crash the bot).
+    """
     global _last_tg_ts
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -88,7 +95,9 @@ async def send_telegram(msg: str):
         return
     _last_tg_ts = now
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0)) as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=3.0)
+        ) as session:
             await session.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                 data={"chat_id": TG_CHAT_ID, "text": msg},
@@ -96,7 +105,6 @@ async def send_telegram(msg: str):
     except Exception:
         # never let TG issues break the bot
         pass
-
 
 # --------------- EXCHANGE CLIENT (ccxt sync wrapped into async) -----------------
 
@@ -135,6 +143,9 @@ class ExchangeClient:
         await asyncio.to_thread(_work)
 
     async def fetch_equity(self) -> float:
+        """
+        Return total USDT equity = wallet + unrealised PnL.
+        """
         def _work():
             bal = self.client.fetch_balance()
             total = float(bal.get("USDT", {}).get("total", 0.0))
@@ -159,7 +170,9 @@ class ExchangeClient:
 
         return await asyncio.to_thread(_work)
 
-    async def create_market_order(self, sym_ws: str, side: str, qty: float, reduce_only: bool = False):
+    async def create_market_order(
+        self, sym_ws: str, side: str, qty: float, reduce_only: bool = False
+    ):
         symbol = SYMBOL_MAP[sym_ws]
         side = side.lower()
         params = {"category": "linear"}
@@ -186,6 +199,7 @@ class ExchangeClient:
         if reduce_only:
             params["reduceOnly"] = True
         if post_only:
+            # Bybit PostOnly in ccxt is via timeInForce=PostOnly
             params["timeInForce"] = "PostOnly"
 
         def _work():
@@ -194,6 +208,9 @@ class ExchangeClient:
         return await asyncio.to_thread(_work)
 
     async def close_position_market(self, sym_ws: str):
+        """
+        Emergency close using market order, reduceOnly.
+        """
         symbol = SYMBOL_MAP[sym_ws]
 
         def _work():
@@ -205,15 +222,16 @@ class ExchangeClient:
                 contracts = float(p.get("contracts") or 0.0)
                 if contracts == 0:
                     continue
-                side = "sell" if p.get("side") == "long" else "buy"
+                side = "sell" if (p.get("side") or "").lower() == "long" else "buy"
                 params = {"category": "linear", "reduceOnly": True}
                 try:
-                    self.client.create_order(symbol, "market", side, abs(contracts), None, params)
+                    self.client.create_order(
+                        symbol, "market", side, abs(contracts), None, params
+                    )
                 except Exception:
                     pass
 
         await asyncio.to_thread(_work)
-
 
 # --------------- DATA STRUCTURES -----------------
 
@@ -242,43 +260,88 @@ class MarketState:
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     def update_book(self, symbol: str, data: dict):
+        """
+        Safe incremental orderbook update from Bybit V5 WS.
+        Handles snapshot+delta, ignores bad/None values.
+        """
         book = self.books[symbol]
-        ts = float(data.get("ts", time.time() * 1000)) / 1000.0
+        try:
+            ts_raw = data.get("ts", time.time() * 1000)
+            ts = float(ts_raw) / 1000.0
+        except Exception:
+            ts = time.time()
         book["ts"] = ts
+
         typ = data.get("type")
+        # Full snapshot
         if typ == "snapshot":
             book["bids"].clear()
             book["asks"].clear()
             for px, qty in data.get("bids", []):
-                book["bids"][float(px)] = float(qty)
+                try:
+                    p = float(px)
+                    q = float(qty)
+                except (TypeError, ValueError):
+                    continue
+                if q > 0:
+                    book["bids"][p] = q
             for px, qty in data.get("asks", []):
-                book["asks"][float(px)] = float(qty)
+                try:
+                    p = float(px)
+                    q = float(qty)
+                except (TypeError, ValueError):
+                    continue
+                if q > 0:
+                    book["asks"][p] = q
             return
+
+        # Delta update
         for key in ("delete", "update", "insert"):
             part = data.get(key, {})
             for px, qty in part.get("bids", []):
-                p, q = float(px), float(qty)
-                if q == 0:
+                try:
+                    p = float(px)
+                    q = float(qty)
+                except (TypeError, ValueError):
+                    continue
+                if q <= 0:
                     book["bids"].pop(p, None)
                 else:
                     book["bids"][p] = q
             for px, qty in part.get("asks", []):
-                p, q = float(px), float(qty)
-                if q == 0:
+                try:
+                    p = float(px)
+                    q = float(qty)
+                except (TypeError, ValueError):
+                    continue
+                if q <= 0:
                     book["asks"].pop(p, None)
                 else:
                     book["asks"][p] = q
 
     def add_trade(self, symbol: str, trade: dict):
-        # trade: {price, size, side, ts}
+        """
+        trade: {price, size, side, ts}
+        Assumes price/size already validated as floats.
+        """
+        if (
+            "price" not in trade
+            or "size" not in trade
+            or "side" not in trade
+            or "ts" not in trade
+        ):
+            return
         self.trades[symbol].append(trade)
 
     def get_best_bid_ask(self, symbol: str) -> Optional[Tuple[float, float]]:
         book = self.books[symbol]
         if not book["bids"] or not book["asks"]:
             return None
-        best_bid = max(book["bids"].keys())
-        best_ask = min(book["asks"].keys())
+        try:
+            best_bid = max(book["bids"].keys())
+            best_ask = min(book["asks"].keys())
+        except ValueError:
+            return None
         return best_bid, best_ask
 
     def compute_features(self, symbol: str) -> Optional[dict]:
@@ -293,24 +356,35 @@ class MarketState:
         if now - book["ts"] > BOOK_STALE_SEC:
             return None
 
+        # top 5 depth
         bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
         asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
+        if not bids_sorted or not asks_sorted:
+            return None
+
         bid_vol = sum(q for _, q in bids_sorted)
         ask_vol = sum(q for _, q in asks_sorted)
-        if bid_vol + ask_vol == 0:
+        if bid_vol + ask_vol <= 0:
             return None
+
         imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
         best_bid = bids_sorted[0][0]
         best_ask = asks_sorted[0][0]
         mid = (best_bid + best_ask) / 2.0
-        spread = (best_ask - best_bid) / mid
+        if mid <= 0:
+            return None
 
-        # recent burst from trades (last 150 ms)
+        spread = (best_ask - best_bid) / mid
+        if spread < 0:
+            return None
+
+        # recent burst from trades (last RECENT_TRADE_WINDOW seconds)
         cutoff = now - RECENT_TRADE_WINDOW
         burst = 0.0
         last_price = None
         recent_prices: List[float] = []
+
         for t in reversed(self.trades[symbol]):
             if t["ts"] < cutoff:
                 break
@@ -340,7 +414,6 @@ class MarketState:
             "burst": burst,
             "range_pct": rng,
         }
-
 
 # --------------- CORE BOT LOGIC -----------------
 
@@ -380,7 +453,7 @@ class ScalperBot:
                     f"🚨 Kill-switch: equity drawdown {dd*100:.2f}%. Position closed."
                 )
                 self.position = None
-            # hard stop (you can change to just "pause" if you want)
+            # hard stop
             raise SystemExit("Kill-switch triggered")
 
     async def eval_symbols_and_maybe_enter(self):
@@ -474,8 +547,12 @@ class ScalperBot:
 
         # ENTRY: market order (simple + reliable)
         try:
-            order = await self.exchange.create_market_order(sym_ws, side, qty, reduce_only=False)
-            entry_price = float(order.get("average") or order.get("price") or mid)
+            order = await self.exchange.create_market_order(
+                sym_ws, side, qty, reduce_only=False
+            )
+            entry_price = float(
+                order.get("average") or order.get("price") or mid
+            )
         except Exception:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
@@ -554,12 +631,13 @@ class ScalperBot:
 
 # --------------- WEBSOCKET LOOP -----------------
 
+
 async def ws_loop(mkt: MarketState):
     """
     One WS connection, multiple topics: orderbook.1 + publicTrade for all symbols.
-    Updates MarketState in real-time.
+    Updates MarketState in real-time safely.
     """
-    topics = []
+    topics: List[str] = []
     for s in SYMBOLS_WS:
         topics.append(f"orderbook.1.{s}")
         topics.append(f"publicTrade.{s}")
@@ -569,43 +647,91 @@ async def ws_loop(mkt: MarketState):
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(WS_URL, heartbeat=15, timeout=30) as ws:
+                async with session.ws_connect(
+                    WS_URL, heartbeat=30, timeout=45
+                ) as ws:
 
                     print("📡 Connected to WS server, subscribing...")
 
                     await ws.send_json({"op": "subscribe", "args": topics})
 
-                    # Mark all symbols as connected
+                    # Mark symbols as connected (only first time -> no spam)
                     for sym in SYMBOLS_WS:
+                        if not ws_ready.get(sym, False):
+                            await send_telegram(f"📡 WS Ready: {sym}")
                         ws_ready[sym] = True
-                        await send_telegram(f"📡 WS Connected: {sym}")
 
                     async for msg in ws:
+
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
+                            try:
+                                data = json.loads(msg.data)
+                            except Exception:
+                                continue
+
                             topic = data.get("topic")
                             if not topic:
                                 continue
 
-                            # Orderbook updates
+                            payload_raw = data.get("data")
+                            if payload_raw in (None, [], {}):
+                                continue
+
+                            # ----- ORDERBOOK -----
                             if topic.startswith("orderbook"):
                                 sym = topic.split(".")[-1]
-                                payload = data["data"][0] if isinstance(data["data"], list) else data["data"]
-                                mkt.update_book(sym, payload)
+                                if sym not in SYMBOLS_WS:
+                                    continue
 
-                            # Trades
+                                # ensure dict
+                                if isinstance(payload_raw, list):
+                                    payload = payload_raw[0] if payload_raw else None
+                                else:
+                                    payload = payload_raw
+
+                                if payload:
+                                    try:
+                                        mkt.update_book(sym, payload)
+                                    except Exception:
+                                        # never crash from bad book data
+                                        continue
+
+                            # ----- TRADES -----
                             elif topic.startswith("publicTrade"):
                                 sym = topic.split(".")[-1]
-                                trades = data["data"] if isinstance(data["data"], list) else [data["data"]]
-                                now = time.time()
-                                for t in trades:
-                                    price = float(t.get("p") or t.get("price"))
-                                    qty = float(t.get("q") or t.get("size"))
-                                    side = (t.get("S") or t.get("side") or "Buy").lower()
+                                if sym not in SYMBOLS_WS:
+                                    continue
+
+                                trades_raw = (
+                                    payload_raw
+                                    if isinstance(payload_raw, list)
+                                    else [payload_raw]
+                                )
+                                now_ts = time.time()
+
+                                for t in trades_raw:
+                                    price = t.get("p") or t.get("price")
+                                    qty = t.get("q") or t.get("size")
+                                    side = (
+                                        t.get("S") or t.get("side") or "Buy"
+                                    ).lower()
+
+                                    if price is None or qty is None:
+                                        continue
+                                    try:
+                                        price_f = float(price)
+                                        qty_f = float(qty)
+                                    except (TypeError, ValueError):
+                                        continue
 
                                     mkt.add_trade(
                                         sym,
-                                        {"price": price, "size": qty, "side": side, "ts": now}
+                                        {
+                                            "price": price_f,
+                                            "size": qty_f,
+                                            "side": side,
+                                            "ts": now_ts,
+                                        },
                                     )
 
                         elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -614,7 +740,7 @@ async def ws_loop(mkt: MarketState):
 
         except Exception as e:
             print(f"❌ WS Loop Crashed: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.0)
 
 # --------------- MAIN LOOP -----------------
 
@@ -648,4 +774,5 @@ if __name__ == "__main__":
         uvloop.install()
     except Exception:
         pass
+
     asyncio.run(main())
