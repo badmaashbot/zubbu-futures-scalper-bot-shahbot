@@ -50,10 +50,11 @@ SYMBOL_MAP = {
     "DOGEUSDT": "DOGE/USDT:USDT",  # if ccxt version differs, adjust here
 }
 
+# --------------- CORRECT WEBSOCKET URL -----------------
 if TESTNET:
-    WS_URL = "wss://stream-testnet.bybit.com/v5/public"
+    WS_URL = "wss://stream-testnet.bybit.com/v5/public/linear"
 else:
-    WS_URL = "wss://stream.bybit.com/v5/public"
+    WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 # --------------- TRADING CONFIG -----------------
 
