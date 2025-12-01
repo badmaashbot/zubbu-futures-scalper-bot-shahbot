@@ -630,13 +630,14 @@ class ScalperBot:
 
 # --------------- WEBSOCKET LOOP -----------------
 
-
 async def ws_loop(mkt: MarketState):
     """
     One WS connection, multiple topics: orderbook.1 + publicTrade for all symbols.
     Updates MarketState in real-time.
     """
-    topics: List[str] = []
+
+    # Correct topics
+    topics = []
     for s in SYMBOLS_WS:
         topics.append(f"orderbook.1.{s}")
         topics.append(f"publicTrade.{s}")
@@ -647,88 +648,84 @@ async def ws_loop(mkt: MarketState):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(
-                    WS_URL, heartbeat=15, timeout=30
+                    WS_URL,
+                    receive_timeout=40,
+                    heartbeat=20
                 ) as ws:
 
                     print("📡 Connected to WS server, subscribing...")
-                    await ws.send_json({"op": "subscribe", "args": topics})
+                    await ws.send_json({
+                        "op": "subscribe",
+                        "args": topics
+                    })
 
-                    # mark all symbols as connected
+                    # Mark symbols as connected
                     for sym in SYMBOLS_WS:
                         ws_ready[sym] = True
 
-                    await send_telegram("📡 WS Connected for all symbols.")
+                    await send_telegram("📡 WS Connected: All symbols")
 
                     async for msg in ws:
+
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
-                            except json.JSONDecodeError:
+                            except:
+                                continue
+
+                            # Ignore subscription confirmation
+                            if data.get("success") is True:
                                 continue
 
                             topic = data.get("topic")
                             if not topic:
-                                # could be subscription confirmation, ignore
                                 continue
 
-                            # Orderbook updates
+                            # -------- ORDERBOOK ----------
                             if topic.startswith("orderbook"):
                                 sym = topic.split(".")[-1]
-                                payload_raw = data.get("data")
-                                if payload_raw is None:
+                                payload = data.get("data")
+                                if not payload:
                                     continue
-                                if isinstance(payload_raw, list) and payload_raw:
-                                    payload = payload_raw[0]
-                                else:
-                                    payload = payload_raw
-                                if not isinstance(payload, dict):
-                                    continue
-                                mkt.update_book(sym, payload)
+                                # Bybit sends array sometimes
+                                if isinstance(payload, list):
+                                    payload = payload[0]
+                                if isinstance(payload, dict):
+                                    mkt.update_book(sym, payload)
 
-                            # Trades
+                            # -------- TRADES ----------
                             elif topic.startswith("publicTrade"):
                                 sym = topic.split(".")[-1]
-                                payload_raw = data.get("data")
-                                if payload_raw is None:
+                                payload = data.get("data")
+                                if not payload:
                                     continue
-                                trades = (
-                                    payload_raw
-                                    if isinstance(payload_raw, list)
-                                    else [payload_raw]
-                                )
-                                now_ts = time.time()
+
+                                trades = payload if isinstance(payload, list) else [payload]
+                                now = time.time()
+
                                 for t in trades:
-                                    price = safe_float(
-                                        t.get("p") or t.get("price")
-                                    )
-                                    qty = safe_float(
-                                        t.get("q") or t.get("size")
-                                    )
-                                    side_str = (
-                                        t.get("S") or t.get("side") or "Buy"
-                                    ).lower()
+                                    price = safe_float(t.get("p") or t.get("price"))
+                                    qty   = safe_float(t.get("q") or t.get("size"))
+                                    side  = (t.get("S") or t.get("side") or "Buy").lower()
+
                                     if price is None or qty is None:
                                         continue
-                                    side = "buy" if side_str == "buy" else "sell"
-                                    mkt.add_trade(
-                                        sym,
-                                        {
-                                            "price": price,
-                                            "size": qty,
-                                            "side": side,
-                                            "ts": now_ts,
-                                        },
-                                    )
+
+                                    mkt.add_trade(sym, {
+                                        "price": price,
+                                        "size": qty,
+                                        "side": "buy" if side == "buy" else "sell",
+                                        "ts": now
+                                    })
 
                         elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print("⚠ WS ERROR — reconnecting in 1 sec")
+                            print("⚠ WS ERROR — reconnecting")
                             break
 
         except Exception as e:
             print(f"❌ WS Loop Crashed: {e}")
-            # mark all as not ready
-            for sym in SYMBOLS_WS:
-                ws_ready[sym] = False
+            for s in SYMBOLS_WS:
+                ws_ready[s] = False
             await asyncio.sleep(1)
 
 
