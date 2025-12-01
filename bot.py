@@ -552,70 +552,51 @@ class ScalperBot:
             f"💤 Bot idle {HEARTBEAT_IDLE_SEC/60:.0f} min. Equity={eq:.2f} USDT"
         )
 
-
-# ------------------ WEBSOCKET LOOP ------------------
+# --------------- WEBSOCKET LOOP -----------------
 
 async def ws_loop(mkt: MarketState):
     """
-    One WS connection, multiple topics: orderbook.1 + publicTrade for all 5 symbols.
+    One WS connection, multiple topics: orderbook.1 + publicTrade for all symbols.
     Updates MarketState in real-time.
     """
-
     topics = []
     for s in SYMBOLS_WS:
         topics.append(f"orderbook.1.{s}")
-    for s in SYMBOLS_WS:
         topics.append(f"publicTrade.{s}")
 
-    global ws_ready
-    # ws_ready = {} must exist at top of file
+    print("⚡ WS loop started... connecting...")
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(WS_URL, heartbeat=10) as ws:
+                async with session.ws_connect(WS_URL, heartbeat=15, timeout=30) as ws:
 
-                    # Subscribe to all topics
-                    sub = {"op": "subscribe", "args": topics}
-                    await ws.send_json(sub)
+                    print("📡 Connected to WS server, subscribing...")
 
-                    # Send "WS Connected" alert ONLY once per each symbol
+                    await ws.send_json({"op": "subscribe", "args": topics})
+
+                    # Mark all symbols as connected
                     for sym in SYMBOLS_WS:
-                        if not ws_ready.get(sym, False):
-                            await send_telegram(f"📡 {sym} WS connected & subscribed.")
-                            ws_ready[sym] = True
+                        ws_ready[sym] = True
+                        await send_telegram(f"📡 WS Connected: {sym}")
 
-                    # --- Main WS message loop ---
                     async for msg in ws:
-
-                        # ---------------- TEXT MESSAGE ----------------
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             topic = data.get("topic")
                             if not topic:
                                 continue
 
-                            # -------- ORDERBOOK --------
+                            # Orderbook updates
                             if topic.startswith("orderbook"):
                                 sym = topic.split(".")[-1]
+                                payload = data["data"][0] if isinstance(data["data"], list) else data["data"]
+                                mkt.update_book(sym, payload)
 
-                                payload = data.get("data")
-                                if isinstance(payload, list):
-                                    payload = payload[0]
-
-                                if payload:
-                                    mkt.update_book(sym, payload)
-
-                            # -------- TRADES --------
+                            # Trades
                             elif topic.startswith("publicTrade"):
                                 sym = topic.split(".")[-1]
-
-                                payload = data.get("data")
-                                if isinstance(payload, list):
-                                    trades = payload
-                                else:
-                                    trades = [payload]
-
+                                trades = data["data"] if isinstance(data["data"], list) else [data["data"]]
                                 now = time.time()
                                 for t in trades:
                                     price = float(t.get("p") or t.get("price"))
@@ -624,22 +605,16 @@ async def ws_loop(mkt: MarketState):
 
                                     mkt.add_trade(
                                         sym,
-                                        {
-                                            "price": price,
-                                            "size": qty,
-                                            "side": side,
-                                            "ts": now,
-                                        },
+                                        {"price": price, "size": qty, "side": side, "ts": now}
                                     )
 
-                        # ---------------- ERROR MESSAGE ----------------
                         elif msg.type == aiohttp.WSMsgType.ERROR:
+                            print("⚠ WS ERROR — reconnecting in 1 sec")
                             break
 
         except Exception as e:
-            log.warning("WS crashed, reconnecting in 1s: %s", e)
+            print(f"❌ WS Loop Crashed: {e}")
             await asyncio.sleep(1)
-
 
 # --------------- MAIN LOOP -----------------
 
