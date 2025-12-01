@@ -19,6 +19,23 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+# --------- MOVE ANALYZER (for Dynamic TP learning) ---------
+
+class MoveAnalyzer:
+    def __init__(self, max_len=500):
+        self.moves = deque(maxlen=max_len)
+
+    def add_move(self, pct):
+        self.moves.append(pct)
+
+    def avg_move(self):
+        if not self.moves:
+            return 0.006  # default 0.6%
+        return sum(self.moves) / len(self.moves)
+
+# Global analyzer
+move_analyzer = MoveAnalyzer()
+
 import aiohttp
 import ccxt  # sync ccxt, we will wrap blocking calls with asyncio.to_thread
 
@@ -61,15 +78,16 @@ else:
 LEVERAGE = 3
 EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notional
 
-TP_PCT = 0.01        # +1% TP
-SL_PCT = 0.005       # -0.5% SL (watchdog, client-side)
+# TP_PCT = 0.01   # dynamic TP is used now, this is disabled
+SL_PCT = 0.0035
 
-IMBALANCE_THRESH = 0.12
-BURST_THRESH = 0.15
-MAX_SPREAD = 0.0004        # 0.04%
-MIN_RANGE_PCT = 0.001      # 0.1% minimal micro-range
-RECENT_TRADE_WINDOW = 0.15 # 150 ms window to measure burst
-BOOK_STALE_SEC = 6.0       # ignore book older than 6s
+# ---------- NEW TUNED FILTERS ----------
+IMBALANCE_THRESH  = 0.06
+BURST_THRESH      = 0.08
+MAX_SPREAD        = 0.0006
+MIN_RANGE_PCT     = 0.0005
+SCORE_MIN         = 2.0
+MAX_SKEW_SEC      = 2.0
 
 KILL_SWITCH_DD = 0.05      # 5% equity drawdown -> stop trading
 HEARTBEAT_IDLE_SEC = 1800  # 30 minutes idle heartbeat
@@ -400,6 +418,76 @@ class MarketState:
             "range_pct": rng,
         }
 
+# ================================================================
+# MOMENTUM, VOLATILITY & DYNAMIC TP MODULES
+# ================================================================
+
+def compute_momentum_score(imb, burst, spread):
+    """Higher score = stronger impulse."""
+    if spread <= 0:
+        spread = 0.000001
+    return abs(imb) * abs(burst) / spread
+
+
+class MoveAnalyzer:
+    """
+    Tracks recent impulse distances
+    and estimates typical TP length.
+    """
+    def __init__(self, max_samples=50):
+        self.moves = []
+        self.max_samples = max_samples
+
+    def add_move(self, distance_pct):
+        self.moves.append(distance_pct)
+        if len(self.moves) > self.max_samples:
+            self.moves.pop(0)
+
+    def avg_move(self):
+        if not self.moves:
+            return 0.006   # default 0.6%
+        return sum(self.moves) / len(self.moves)
+
+
+move_analyzer = MoveAnalyzer()
+
+
+def predict_volatility(trades_last_2s):
+    """
+    Simple volatility estimate using trade count + price range.
+    """
+    if len(trades_last_2s) < 4:
+        return 0.0
+    prices = [t['price'] for t in trades_last_2s]
+    high = max(prices)
+    low = min(prices)
+    mid = (high + low) / 2
+    if mid <= 0:
+        return 0.0
+    return (high - low) / mid
+
+
+def choose_dynamic_tp(imb, burst, spread, volatility):
+    """
+    Selects TP based on impulse strength & market speed.
+    """
+    score = compute_momentum_score(imb, burst, spread)
+
+    # Weak impulse → small TP
+    if score < 2.0:
+        return 0.004     # 0.4%
+
+    # Normal impulse
+    if score < 4.0:
+        return 0.006     # 0.6%
+
+    # Strong impulse
+    if score < 8.0:
+        return 0.009     # 0.9%
+
+    # Very strong impulse (rare + powerful)
+    return 0.012         # 1.2%
+
 
 # --------------- CORE BOT LOGIC -----------------
 
@@ -454,15 +542,20 @@ class ScalperBot:
         best_feat: Optional[dict] = None
         now = time.time()
 
-        for sym in SYMBOLS_WS:
-            feat = self.mkt.compute_features(sym)
-            if not feat:
-                continue
+for sym in SYMBOLS_WS:
+    feat = self.mkt.compute_features(sym)
+    if not feat:
+        continue
 
-            imb = feat["imbalance"]
-            burst = feat["burst"]
-            spread = feat["spread"]
-            rng = feat["range_pct"]
+    imb = feat["imbalance"]
+    burst = feat["burst"]
+    spread = feat["spread"]
+    rng = feat["range_pct"]
+
+    # ----- SCORE FILTER -----
+    score = abs(imb) * abs(burst) / max(spread, 1e-6)
+    if score < SCORE_MIN:
+        continue
 
             # basic filters
             if spread <= 0 or spread > MAX_SPREAD:
@@ -525,13 +618,24 @@ class ScalperBot:
         if qty <= 0:
             return
 
-        # TP/SL targets
-        if side == "buy":
-            tp_price = mid * (1.0 + TP_PCT)
-            sl_price = mid * (1.0 - SL_PCT)
-        else:
-            tp_price = mid * (1.0 - TP_PCT)
-            sl_price = mid * (1.0 + SL_PCT)
+# ---------------- DYNAMIC TP SYSTEM ----------------
+# compute dynamic TP using orderflow strength
+score_tp = choose_dynamic_tp(
+    feat["imbalance"],
+    feat["burst"],
+    feat["spread"],
+    feat["range_pct"]
+)
+
+# still use your SL_PCT for safety
+sl_pct = SL_PCT
+
+if side == "buy":
+    tp_price = mid * (1.0 + score_tp)
+    sl_price = mid * (1.0 - sl_pct)
+else:
+    tp_price = mid * (1.0 - score_tp)
+    sl_price = mid * (1.0 + sl_pct)
 
         # ENTRY: market order (simple + reliable)
         try:
@@ -600,17 +704,29 @@ class ScalperBot:
         else:
             dd = (mid - pos.entry_price) / pos.entry_price
 
-        if dd >= SL_PCT * 1.1:
-            await self.exchange.close_position_market(sym)
-            print(
-                f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"now={mid:.4f} DD={dd*100:.2f}%"
-            )
-            await send_telegram(
-                f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"now={mid:.4f} DD={dd*100:.2f}%"
-            )
-            self.position = None
+if dd >= SL_PCT * 1.1:
+
+    # ❗ 1) CLOSE THE POSITION
+    await self.exchange.close_position_market(sym)
+
+    # ❗ 2) LOG MOVE LENGTH FOR DYNAMIC TP TRAINING
+    # dd = % move against us
+    move_pct = dd
+    move_analyzer.add_move(abs(move_pct))
+
+    # ❗ 3) DEBUG + TELEGRAM
+    print(
+        f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+        f"now={mid:.4f} DD={dd*100:.2f}%"
+    )
+    await send_telegram(
+        f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+        f"now={mid:.4f} DD={dd*100:.2f}%"
+    )
+
+    # ❗ 4) RESET POSITION
+    self.position = None
+    return
 
     async def maybe_heartbeat(self):
         """
