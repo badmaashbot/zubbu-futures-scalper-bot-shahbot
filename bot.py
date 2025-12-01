@@ -705,7 +705,7 @@ async def ws_loop(mkt: MarketState):
 
                                 for t in trades:
                                     price = safe_float(t.get("p") or t.get("price"))
-                                    qty   = safe_float(t.get("q") or t.get("size"))
+                                    qty = safe_float(t.get("v") or t.get("q") or t.get("size"))
                                     side  = (t.get("S") or t.get("side") or "Buy").lower()
 
                                     if price is None or qty is None:
