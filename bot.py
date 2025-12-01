@@ -81,13 +81,11 @@ EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notion
 # TP_PCT = 0.01   # dynamic TP is used now, this is disabled
 SL_PCT = 0.0035
 
-# ---------- NEW TUNED FILTERS ----------
-IMBALANCE_THRESH  = 0.06
-BURST_THRESH      = 0.08
-MAX_SPREAD        = 0.0006
-MIN_RANGE_PCT     = 0.0005
-SCORE_MIN         = 2.0
-MAX_SKEW_SEC      = 2.0
+SCORE_MIN = 1.1        # was 2.0 → now easier to trigger
+IMBALANCE_THRESH = 0.025   # was 0.06
+BURST_THRESH = 0.035       # was 0.08
+MAX_SPREAD = 0.0010        # was 0.0006
+MIN_RANGE_PCT = 0.00025    # was 0.0005
 
 RECENT_TRADE_WINDOW = 0.15   # 150 ms window to measure trade burst
 BOOK_STALE_SEC      = 6.0    # ignore orderbook older than 6 seconds
