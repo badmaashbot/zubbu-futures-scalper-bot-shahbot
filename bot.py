@@ -51,9 +51,9 @@ SYMBOL_MAP = {
 }
 
 WS_URL = (
-    "wss://stream-testnet.bybit.com/v5/public/linear"
+    "wss://stream-testnet.bybit.com/v5/public"
     if TESTNET
-    else "wss://stream.bybit.com/v5/public/linear"
+    else "wss://stream.bybit.com/v5/public"
 )
 
 # --------------- TRADING CONFIG -----------------
