@@ -89,8 +89,11 @@ MIN_RANGE_PCT     = 0.0005
 SCORE_MIN         = 2.0
 MAX_SKEW_SEC      = 2.0
 
-KILL_SWITCH_DD = 0.05      # 5% equity drawdown -> stop trading
-HEARTBEAT_IDLE_SEC = 1800  # 30 minutes idle heartbeat
+RECENT_TRADE_WINDOW = 0.15   # 150 ms window to measure trade burst
+BOOK_STALE_SEC      = 6.0    # ignore orderbook older than 6 seconds
+
+KILL_SWITCH_DD = 0.05
+HEARTBEAT_IDLE_SEC = 1800
 
 MIN_QTY_MAP = {
     "BTCUSDT": 0.001,
