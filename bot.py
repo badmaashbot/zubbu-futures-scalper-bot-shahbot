@@ -418,41 +418,46 @@ class MarketState:
             "range_pct": rng,
         }
 
-def predict_volatility(trades_last_2s):
+# =====================================================
+# MOMENTUM & DYNAMIC TP HELPERS
+# =====================================================
+
+def compute_momentum_score(imbalance: float, burst: float, spread: float) -> float:
     """
-    Simple volatility estimate using trade count + price range.
+    Simple impulse strength score.
+    Higher = stronger push in one direction.
     """
-    if len(trades_last_2s) < 4:
-        return 0.0
-    prices = [t['price'] for t in trades_last_2s]
-    high = max(prices)
-    low = min(prices)
-    mid = (high + low) / 2
-    if mid <= 0:
-        return 0.0
-    return (high - low) / mid
+    if spread <= 0:
+        spread = 1e-6
+    return abs(imbalance) * abs(burst) / spread
 
 
-def choose_dynamic_tp(imb, burst, spread, volatility):
+def choose_dynamic_tp(
+    imbalance: float,
+    burst: float,
+    spread: float,
+    range_pct: float,
+) -> float:
     """
-    Selects TP based on impulse strength & market speed.
+    Select TP % based on impulse strength.
+    Uses orderflow only (no heavy history), so it stays fast.
     """
-    score = compute_momentum_score(imb, burst, spread)
+    score = compute_momentum_score(imbalance, burst, spread)
 
     # Weak impulse → small TP
     if score < 2.0:
-        return 0.004     # 0.4%
+        return 0.004   # 0.4 %
 
     # Normal impulse
     if score < 4.0:
-        return 0.006     # 0.6%
+        return 0.006   # 0.6 %
 
     # Strong impulse
     if score < 8.0:
-        return 0.009     # 0.9%
+        return 0.009   # 0.9 %
 
-    # Very strong impulse (rare + powerful)
-    return 0.012         # 1.2%
+    # Very strong impulse (rare but powerful)
+    return 0.012       # 1.2 %
 
 
 # --------------- CORE BOT LOGIC -----------------
@@ -482,14 +487,12 @@ class ScalperBot:
 
     async def maybe_kill_switch(self):
         if self.start_equity is None:
-            # not initialized yet
             return
         eq = await self.exchange.fetch_equity()
         if self.start_equity <= 0:
             return
         dd = (self.start_equity - eq) / self.start_equity
         if dd >= KILL_SWITCH_DD:
-            # close any open position
             if self.position:
                 await self.exchange.close_position_market(self.position.symbol_ws)
                 await send_telegram(
@@ -499,7 +502,10 @@ class ScalperBot:
             raise SystemExit("Kill-switch triggered")
 
     async def eval_symbols_and_maybe_enter(self):
-        # only one position at a time
+        """
+        Scan all symbols, compute features, pick the best one and open position.
+        Only runs when there is NO open position.
+        """
         if self.position is not None:
             return
 
@@ -508,36 +514,36 @@ class ScalperBot:
         best_feat: Optional[dict] = None
         now = time.time()
 
-for sym in SYMBOLS_WS:
-    feat = self.mkt.compute_features(sym)
-    if not feat:
-        continue
+        for sym in SYMBOLS_WS:
+            feat = self.mkt.compute_features(sym)
+            if not feat:
+                continue
 
-    imb = feat["imbalance"]
-    burst = feat["burst"]
-    spread = feat["spread"]
-    rng = feat["range_pct"]
+            imb = feat["imbalance"]
+            burst = feat["burst"]
+            spread = feat["spread"]
+            rng = feat["range_pct"]
 
-    # ----- SCORE FILTER -----
-    score = abs(imb) * abs(burst) / max(spread, 1e-6)
-    if score < SCORE_MIN:
-        continue
+            # ----- SCORE FILTER (main gate) -----
+            score = abs(imb) * abs(burst) / max(spread, 1e-6)
+            if score < SCORE_MIN:
+                continue
 
-    # ----- BASIC FILTERS -----
-    if spread <= 0 or spread > MAX_SPREAD:
-        continue
-    if abs(imb) < IMBALANCE_THRESH:
-        continue
-    if abs(burst) < BURST_THRESH:
-        continue
-    if rng < MIN_RANGE_PCT:
-        continue
+            # ----- BASIC FILTERS -----
+            if spread <= 0 or spread > MAX_SPREAD:
+                continue
+            if abs(imb) < IMBALANCE_THRESH:
+                continue
+            if abs(burst) < BURST_THRESH:
+                continue
+            if rng < MIN_RANGE_PCT:
+                continue
 
-    # choose best symbol
-    if score > best_score:
-        best_score = score
-        best_sym = sym
-        best_feat = feat
+            # choose best symbol
+            if score > best_score:
+                best_score = score
+                best_sym = sym
+                best_feat = feat
 
         if not best_sym or not best_feat:
             await self.maybe_heartbeat()
@@ -551,6 +557,9 @@ for sym in SYMBOLS_WS:
         await self.open_position(best_sym, best_feat)
 
     async def open_position(self, sym_ws: str, feat: dict):
+        """
+        Open a new position with dynamic TP and fixed SL.
+        """
         try:
             equity = await self.exchange.fetch_equity()
         except Exception:
@@ -578,29 +587,28 @@ for sym in SYMBOLS_WS:
         min_qty = MIN_QTY_MAP.get(sym_ws, 0.0)
         if qty < min_qty:
             return
+
         # round qty down to 3 decimals
         qty = math.floor(qty * 1000) / 1000.0
         if qty <= 0:
             return
 
-# ---------------- DYNAMIC TP SYSTEM ----------------
-# compute dynamic TP using orderflow strength
-score_tp = choose_dynamic_tp(
-    feat["imbalance"],
-    feat["burst"],
-    feat["spread"],
-    feat["range_pct"]
-)
+        # ---------------- DYNAMIC TP SYSTEM ----------------
+        score_tp = choose_dynamic_tp(
+            feat["imbalance"],
+            feat["burst"],
+            feat["spread"],
+            feat["range_pct"],
+        )
 
-# still use your SL_PCT for safety
-sl_pct = SL_PCT
+        sl_pct = SL_PCT
 
-if side == "buy":
-    tp_price = mid * (1.0 + score_tp)
-    sl_price = mid * (1.0 - sl_pct)
-else:
-    tp_price = mid * (1.0 - score_tp)
-    sl_price = mid * (1.0 + sl_pct)
+        if side == "buy":
+            tp_price = mid * (1.0 + score_tp)
+            sl_price = mid * (1.0 - sl_pct)
+        else:
+            tp_price = mid * (1.0 - score_tp)
+            sl_price = mid * (1.0 + sl_pct)
 
         # ENTRY: market order (simple + reliable)
         try:
@@ -669,29 +677,24 @@ else:
         else:
             dd = (mid - pos.entry_price) / pos.entry_price
 
-            if dd >= SL_PCT * 1.1:
+        if dd >= SL_PCT * 1.1:
+            await self.exchange.close_position_market(sym)
 
-                # CLOSE POSITION
-                await self.exchange.close_position_market(sym)
+            # log move length for TP learning
+            move_pct = dd
+            move_analyzer.add_move(abs(move_pct))
 
-                # LOG MOVE LENGTH FOR DYNAMIC TP TRAINING
-                move_pct = dd
-                move_analyzer.add_move(abs(move_pct))
+            print(
+                f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"now={mid:.4f} DD={dd*100:.2f}%"
+            )
+            await send_telegram(
+                f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"now={mid:.4f} DD={dd*100:.2f}%"
+            )
 
-                # PRINT + TELEGRAM
-                print(
-                    f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                    f"now={mid:.4f} DD={dd*100:.2f}%"
-                )
-                await send_telegram(
-                    f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                    f"now={mid:.4f} DD={dd*100:.2f}%"
-                )
-
-                # CLEAR POSITION
-                self.position = None
-                return
-
+            self.position = None
+            return
 
     async def maybe_heartbeat(self):
         """
