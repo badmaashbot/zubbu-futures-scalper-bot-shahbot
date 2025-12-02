@@ -509,6 +509,8 @@ async def init_equity_and_leverage(self):
         logging.exception(">>> FIRST EQUITY CALL REJECTED <<<")
         raise
     self.start_equity = eq
+    ...
+
         print(f"[INIT] Equity: {eq:.2f} USDT", flush=True)
         await send_telegram(
             f"🟢 Bot started. Equity: {eq:.2f} USDT. Kill at {KILL_SWITCH_DD*100:.1f}% DD."
