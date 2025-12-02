@@ -494,30 +494,25 @@ def log_skip(sym: str, reason: str, feat: dict):
 
 
 class ScalperBot:
-    def __init__(self, exchange: ExchangeClient, mkt: MarketState):
-        self.exchange = exchange
-        self.mkt = mkt
-        self.position: Optional[Position] = None
-        self.start_equity: Optional[float] = None
-        self.last_trade_time: float = 0.0
-        self.last_heartbeat_ts: float = 0.0
-
-async def init_equity_and_leverage(self):
-    try:
-        eq = await self.exchange.fetch_equity()
-    except Exception as e:
-        logging.exception(">>> FIRST EQUITY CALL REJECTED <<<")
-        raise
-    self.start_equity = eq
-    print(f"[INIT] Equity: {eq:.2f} USDT", flush=True)
-    await send_telegram(
-        f"🟢 Bot started. Equity: {eq:.2f} USDT. Kill at {KILL_SWITCH_DD*100:.1f}% DD."
-    )
-    # set leverage for all symbols
-    for s in SYMBOLS_WS:
-        await self.exchange.set_leverage(s, LEVERAGE)
-    print("[INIT] Leverage set for all symbols.", flush=True)
-    await send_telegram("⚙️ Leverage set for all symbols.")
+    ...
+    # ========  add this back  ========
+    async def init_equity_and_leverage(self):
+        try:
+            eq = await self.exchange.fetch_equity()
+        except Exception as e:
+            logging.exception(">>> FIRST EQUITY CALL REJECTED <<<")
+            raise
+        self.start_equity = eq
+        print(f"[INIT] Equity: {eq:.2f} USDT", flush=True)
+        await send_telegram(
+            f"🟢 Bot started. Equity: {eq:.2f} USDT. Kill at {KILL_SWITCH_DD*100:.1f}% DD."
+        )
+        # set leverage for all symbols
+        for s in SYMBOLS_WS:
+            await self.exchange.set_leverage(s, LEVERAGE)
+        print("[INIT] Leverage set for all symbols.", flush=True)
+        await send_telegram("⚙️ Leverage set for all symbols.")
+    # ==================================
     
     async def maybe_kill_switch(self):
         if self.start_equity is None:
