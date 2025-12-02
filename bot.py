@@ -50,12 +50,15 @@ def log_skip(sym: str, reason: str, feat: dict):
     )
 
 # --------- DEBUG SKIP LOGGER ---------
-def log_skip(sym, reason, feat):
-    print(f"[SKIP] {sym}: {reason} | mid={feat.get('mid'):.5f} "
-          f"imb={feat.get('imbalance'):.4f} "
-          f"burst={feat.get('burst'):.4f} "
-          f"spread={feat.get('spread'):.6f} "
-          f"rng={feat.get('range_pct'):.6f}")
+def log_skip(sym: str, reason: str, feat: dict):
+    print(
+        f"[SKIP] {sym}: {reason} | "
+        f"spread={feat.get('spread',0):.6f}, "
+        f"imb={feat.get('imbalance',0):.4f}, "
+        f"burst={feat.get('burst',0):.4f}, "
+        f"range={feat.get('range_pct',0):.6f}",
+        flush=True
+    )
 
 # --------------- ENV / BASIC CONFIG -----------------
 
