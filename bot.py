@@ -467,6 +467,11 @@ def choose_dynamic_tp(
     # Very strong impulse (rare but powerful)
     return 0.012       # 1.2 %
 
+def log_skip(sym: str, reason: str, feat: dict):
+    print(f"[SKIP] {sym}: {reason} | spread={feat['spread']:.6f}, "
+          f"imb={feat['imbalance']:.4f}, burst={feat['burst']:.4f}, "
+          f"range={feat['range_pct']:.6f}")
+
 
 # --------------- CORE BOT LOGIC -----------------
 
@@ -494,9 +499,6 @@ class ScalperBot:
         await send_telegram("⚙️ Leverage set for all symbols.")
 
     async def maybe_kill_switch(self):
-        """
-        Stop the bot if equity drawdown exceeds KILL_SWITCH_DD.
-        """
         if self.start_equity is None:
             return
         eq = await self.exchange.fetch_equity()
@@ -535,13 +537,14 @@ class ScalperBot:
             spread = feat["spread"]
             rng = feat["range_pct"]
 
-            # ---------------- SCORE FILTER (main gate) ----------------
+            # ----- SCORE (impulse strength) -----
             score = abs(imb) * abs(burst) / max(spread, 1e-6)
+
+            # ----- FILTERS WITH DEBUG LOGS -----
             if score < SCORE_MIN:
                 log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
                 continue
 
-            # ---------------- BASIC FILTERS ----------------
             if spread <= 0 or spread > MAX_SPREAD:
                 log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
                 continue
@@ -570,18 +573,17 @@ class ScalperBot:
                 )
                 continue
 
-            # ---------------- PICK BEST SYMBOL ----------------
+            # ----- CHOOSE BEST SYMBOL -----
             if score > best_score:
                 best_score = score
                 best_sym = sym
                 best_feat = feat
 
-        # No valid trade this loop
         if not best_sym or not best_feat:
             await self.maybe_heartbeat()
             return
 
-        # Tiny anti-spam: don't double-trigger same symbol in <0.5s
+        # tiny anti-spam: don't double-trigger same symbol in <0.5s
         if now - self.mkt.last_signal_ts[best_sym] < 0.5:
             return
         self.mkt.last_signal_ts[best_sym] = now
@@ -603,16 +605,16 @@ class ScalperBot:
         imb = feat["imbalance"]
         burst = feat["burst"]
 
-        # -------- Direction (long / short) --------
+        # direction from orderflow
+        side: Optional[str] = None
         if imb > 0 and burst > 0:
             side = "buy"
         elif imb < 0 and burst < 0:
             side = "sell"
         else:
-            log_skip(sym_ws, "mixed signals (imbalance & burst disagree)", feat)
+            # no clear direction
             return
 
-        # -------- Position sizing --------
         notional = equity * EQUITY_USE_FRACTION * LEVERAGE
         if mid <= 0:
             return
@@ -620,22 +622,21 @@ class ScalperBot:
 
         min_qty = MIN_QTY_MAP.get(sym_ws, 0.0)
         if qty < min_qty:
-            log_skip(sym_ws, f"qty {qty:.6f} < min_qty {min_qty}", feat)
             return
 
         # round qty down to 3 decimals
         qty = math.floor(qty * 1000) / 1000.0
         if qty <= 0:
-            log_skip(sym_ws, "qty rounded down to 0", feat)
             return
 
-        # -------- DYNAMIC TP SYSTEM --------
+        # ---------------- DYNAMIC TP SYSTEM ----------------
         score_tp = choose_dynamic_tp(
             feat["imbalance"],
             feat["burst"],
             feat["spread"],
             feat["range_pct"],
         )
+
         sl_pct = SL_PCT
 
         if side == "buy":
@@ -645,7 +646,7 @@ class ScalperBot:
             tp_price = mid * (1.0 - score_tp)
             sl_price = mid * (1.0 + sl_pct)
 
-        # -------- ENTRY: market order (simple + reliable) --------
+        # ENTRY: market order (simple + reliable)
         try:
             order = await self.exchange.create_market_order(
                 sym_ws, side, qty, reduce_only=False
@@ -658,7 +659,7 @@ class ScalperBot:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
-        # -------- TP as limit reduce-only maker --------
+        # TP as limit reduce-only maker
         opp_side = "sell" if side == "buy" else "buy"
         try:
             await self.exchange.create_limit_order(
@@ -673,7 +674,6 @@ class ScalperBot:
             print(f"[TP ERROR] {sym_ws}: {e}")
             await send_telegram(f"⚠️ TP order placement failed for {sym_ws}")
 
-        # -------- Save position state --------
         self.position = Position(
             symbol_ws=sym_ws,
             side=side,
@@ -689,8 +689,8 @@ class ScalperBot:
             f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
         await send_telegram(
-            f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} "
-            f"entry={entry_price:.4f} TP={tp_price:.4f} SL≈{sl_price:.4f}"
+            f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
+            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
 
     async def watchdog_position(self):
@@ -699,7 +699,6 @@ class ScalperBot:
         """
         if not self.position:
             return
-
         sym = self.position.symbol_ws
         feat = self.mkt.compute_features(sym)
         if not feat:
@@ -715,7 +714,6 @@ class ScalperBot:
             dd = (mid - pos.entry_price) / pos.entry_price
 
         if dd >= SL_PCT * 1.1:
-            # close position
             await self.exchange.close_position_market(sym)
 
             # log move length for TP learning
@@ -732,6 +730,7 @@ class ScalperBot:
             )
 
             self.position = None
+            return
 
     async def maybe_heartbeat(self):
         """
@@ -742,7 +741,6 @@ class ScalperBot:
             return
         if now - self.last_heartbeat_ts < HEARTBEAT_IDLE_SEC:
             return
-
         self.last_heartbeat_ts = now
         eq = await self.exchange.fetch_equity()
         print(f"[HEARTBEAT] idle, equity={eq:.2f}")
