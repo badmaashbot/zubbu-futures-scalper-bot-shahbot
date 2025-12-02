@@ -526,19 +526,25 @@ class ScalperBot:
             rng = feat["range_pct"]
 
             # ----- SCORE FILTER (main gate) -----
-            score = abs(imb) * abs(burst) / max(spread, 1e-6)
-            if score < SCORE_MIN:
-                continue
+if score < SCORE_MIN:
+    log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
+    continue
 
-            # ----- BASIC FILTERS -----
-            if spread <= 0 or spread > MAX_SPREAD:
-                continue
-            if abs(imb) < IMBALANCE_THRESH:
-                continue
-            if abs(burst) < BURST_THRESH:
-                continue
-            if rng < MIN_RANGE_PCT:
-                continue
+if spread <= 0 or spread > MAX_SPREAD:
+    log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
+    continue
+
+if abs(imb) < IMBALANCE_THRESH:
+    log_skip(sym, f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
+    continue
+
+if abs(burst) < BURST_THRESH:
+    log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
+    continue
+
+if rng < MIN_RANGE_PCT:
+    log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
+    continue
 
             # choose best symbol
             if score > best_score:
