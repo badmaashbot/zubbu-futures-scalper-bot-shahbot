@@ -9,6 +9,10 @@ Bybit USDT Perp Micro-Scalper (Balanced Mode, Single Position)
 - Built-in debug console (type commands in tmux: ws, book, trades, pos, help)
 """
 
+import traceback, sys, logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(message)s")
+sys.excepthook = lambda t, v, tb: traceback.print_exception(t, v, tb)
+
 import os
 import time
 import json
@@ -529,23 +533,6 @@ class ScalperBot:
 
     async def eval_symbols_and_maybe_enter(self):
         """
-
-            # ---------- FORCE ONE TEST TRADE ----------
-    if self.position is None and time.time() % 30 < 1:  # once every 30 s
-        sym = "BTCUSDT"
-        feat = self.mkt.compute_features(sym)
-        if feat:
-            print("[FORCE] entering BTCUSDT with live price")
-            await self.open_position(sym, feat)
-            return
-    # ------------------------------------------
-
-    best_score = -1
-    best_sym = None
-    best_feat = None
-    now = time.time()
-
-    
         Scan all symbols, compute features, pick the best one and open position.
         Only runs when there is NO open position.
         """
@@ -942,7 +929,10 @@ async def main():
             await bot.maybe_kill_switch()
             await bot.eval_symbols_and_maybe_enter()
             await bot.watchdog_position()
-            await asyncio.sleep(1.0)  # 1-second scan loop
+            await asyncio.sleep(1)
+    except Exception as e:
+        logging.exception(">>> FIRST REAL CRASH <<<")
+        raise
     finally:
         ws_task.cancel()
         try:
