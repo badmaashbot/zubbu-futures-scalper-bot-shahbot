@@ -501,14 +501,14 @@ class ScalperBot:
     async def init_equity_and_leverage(self):
         eq = await self.exchange.fetch_equity()
         self.start_equity = eq
-        print(f"[INIT] Equity: {eq:.2f} USDT")
+        print(f"[INIT] Equity: {eq:.2f} USDT", flush=True)
         await send_telegram(
             f"🟢 Bot started. Equity: {eq:.2f} USDT. Kill at {KILL_SWITCH_DD*100:.1f}% DD."
         )
         # set leverage for all symbols
         for s in SYMBOLS_WS:
             await self.exchange.set_leverage(s, LEVERAGE)
-        print("[INIT] Leverage set for all symbols.")
+        print("[INIT] Leverage set for all symbols.", flush=True)
         await send_telegram("⚙️ Leverage set for all symbols.")
 
     async def maybe_kill_switch(self):
@@ -551,26 +551,29 @@ class ScalperBot:
             rng = feat["range_pct"]
 
             # ----- SCORE (impulse strength) -----
-score = abs(imb) * abs(burst) / max(spread, 1e-6)
-if score < SCORE_MIN:
-    log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
-    continue
+            score = abs(imb) * abs(burst) / max(spread, 1e-6)
 
-if spread <= 0 or spread > MAX_SPREAD:
-    log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
-    continue
+            # ----- FILTERS + DEBUG SKIPS -----
+            if score < SCORE_MIN:
+                log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
+                continue
 
-if abs(imb) < IMBALANCE_THRESH:
-    log_skip(sym, f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
-    continue
+            if spread <= 0 or spread > MAX_SPREAD:
+                log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
+                continue
 
-if abs(burst) < BURST_THRESH:
-    log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
-    continue
+            if abs(imb) < IMBALANCE_THRESH:
+                log_skip(sym, f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
+                continue
 
-if rng < MIN_RANGE_PCT:
-    log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
-    continue
+            if abs(burst) < BURST_THRESH:
+                log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
+                continue
+
+            if rng < MIN_RANGE_PCT:
+                log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
+                continue
+
             # ----- CHOOSE BEST SYMBOL -----
             if score > best_score:
                 best_score = score
@@ -611,6 +614,7 @@ if rng < MIN_RANGE_PCT:
             side = "sell"
         else:
             # no clear direction
+            log_skip(sym_ws, "no clear direction (imb*burst <= 0)", feat)
             return
 
         notional = equity * EQUITY_USE_FRACTION * LEVERAGE
@@ -620,6 +624,7 @@ if rng < MIN_RANGE_PCT:
 
         min_qty = MIN_QTY_MAP.get(sym_ws, 0.0)
         if qty < min_qty:
+            print(f"[SKIP ENTRY] {sym_ws}: qty {qty} < min_qty {min_qty}", flush=True)
             return
 
         # round qty down to 3 decimals
@@ -653,7 +658,7 @@ if rng < MIN_RANGE_PCT:
                 order.get("average") or order.get("price"), mid
             ) or mid
         except Exception as e:
-            print(f"[ENTRY ERROR] {sym_ws}: {e}")
+            print(f"[ENTRY ERROR] {sym_ws}: {e}", flush=True)
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
@@ -669,7 +674,7 @@ if rng < MIN_RANGE_PCT:
                 post_only=True,
             )
         except Exception as e:
-            print(f"[TP ERROR] {sym_ws}: {e}")
+            print(f"[TP ERROR] {sym_ws}: {e}", flush=True)
             await send_telegram(f"⚠️ TP order placement failed for {sym_ws}")
 
         self.position = Position(
@@ -684,7 +689,8 @@ if rng < MIN_RANGE_PCT:
         self.last_trade_time = time.time()
         print(
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
+            f"TP={tp_price:.4f} SL≈{sl_price:.4f}",
+            flush=True,
         )
         await send_telegram(
             f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
@@ -720,7 +726,8 @@ if rng < MIN_RANGE_PCT:
 
             print(
                 f"[SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"now={mid:.4f} DD={dd*100:.2f}%"
+                f"now={mid:.4f} DD={dd*100:.2f}%",
+                flush=True,
             )
             await send_telegram(
                 f"🛑 SL (watchdog) {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
@@ -741,7 +748,7 @@ if rng < MIN_RANGE_PCT:
             return
         self.last_heartbeat_ts = now
         eq = await self.exchange.fetch_equity()
-        print(f"[HEARTBEAT] idle, equity={eq:.2f}")
+        print(f"[HEARTBEAT] idle, equity={eq:.2f}", flush=True)
         await send_telegram(
             f"💤 Bot idle {HEARTBEAT_IDLE_SEC/60:.0f} min. Equity={eq:.2f} USDT"
         )
