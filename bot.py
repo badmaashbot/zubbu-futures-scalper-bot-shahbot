@@ -926,7 +926,7 @@ async def main():
 
 await bot.init_equity_and_leverage()
 
-    ws_task = asyncio.create_task(ws_loop(mkt))
+ws_task = asyncio.create_task(ws_loop(mkt))
 
     try:
         while True:
