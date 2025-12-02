@@ -9,7 +9,7 @@ Bybit USDT Perp Micro-Scalper (Balanced Mode, Single Position)
 - Built-in debug console (type commands in tmux: ws, book, trades, pos, help)
 """
 
-import traceback, sys, logging
+import logging, traceback, sys
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(message)s")
 sys.excepthook = lambda t, v, tb: traceback.print_exception(t, v, tb)
 
@@ -502,9 +502,13 @@ class ScalperBot:
         self.last_trade_time: float = 0.0
         self.last_heartbeat_ts: float = 0.0
 
-    async def init_equity_and_leverage(self):
+async def init_equity_and_leverage(self):
+    try:
         eq = await self.exchange.fetch_equity()
-        self.start_equity = eq
+    except Exception as e:
+        logging.exception(">>> FIRST EQUITY CALL REJECTED <<<")
+        raise
+    self.start_equity = eq
         print(f"[INIT] Equity: {eq:.2f} USDT", flush=True)
         await send_telegram(
             f"🟢 Bot started. Equity: {eq:.2f} USDT. Kill at {KILL_SWITCH_DD*100:.1f}% DD."
@@ -929,10 +933,7 @@ async def main():
             await bot.maybe_kill_switch()
             await bot.eval_symbols_and_maybe_enter()
             await bot.watchdog_position()
-            await asyncio.sleep(1)
-    except Exception as e:
-        logging.exception(">>> FIRST REAL CRASH <<<")
-        raise
+            await asyncio.sleep(1.0)
     finally:
         ws_task.cancel()
         try:
