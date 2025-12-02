@@ -39,6 +39,13 @@ move_analyzer = MoveAnalyzer()
 import aiohttp
 import ccxt  # sync ccxt, we will wrap blocking calls with asyncio.to_thread
 
+# --------- DEBUG SKIP LOGGER ---------
+def log_skip(sym, reason, feat):
+    print(f"[SKIP] {sym}: {reason} | mid={feat.get('mid'):.5f} "
+          f"imb={feat.get('imbalance'):.4f} "
+          f"burst={feat.get('burst'):.4f} "
+          f"spread={feat.get('spread'):.6f} "
+          f"rng={feat.get('range_pct'):.6f}")
 
 # --------------- ENV / BASIC CONFIG -----------------
 
@@ -487,6 +494,9 @@ class ScalperBot:
         await send_telegram("⚙️ Leverage set for all symbols.")
 
     async def maybe_kill_switch(self):
+        """
+        Stop the bot if equity drawdown exceeds KILL_SWITCH_DD.
+        """
         if self.start_equity is None:
             return
         eq = await self.exchange.fetch_equity()
@@ -525,38 +535,53 @@ class ScalperBot:
             spread = feat["spread"]
             rng = feat["range_pct"]
 
-            # ----- SCORE FILTER (main gate) -----
-if score < SCORE_MIN:
-    log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
-    continue
+            # ---------------- SCORE FILTER (main gate) ----------------
+            score = abs(imb) * abs(burst) / max(spread, 1e-6)
+            if score < SCORE_MIN:
+                log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
+                continue
 
-if spread <= 0 or spread > MAX_SPREAD:
-    log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
-    continue
+            # ---------------- BASIC FILTERS ----------------
+            if spread <= 0 or spread > MAX_SPREAD:
+                log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
+                continue
 
-if abs(imb) < IMBALANCE_THRESH:
-    log_skip(sym, f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
-    continue
+            if abs(imb) < IMBALANCE_THRESH:
+                log_skip(
+                    sym,
+                    f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}",
+                    feat,
+                )
+                continue
 
-if abs(burst) < BURST_THRESH:
-    log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
-    continue
+            if abs(burst) < BURST_THRESH:
+                log_skip(
+                    sym,
+                    f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}",
+                    feat,
+                )
+                continue
 
-if rng < MIN_RANGE_PCT:
-    log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
-    continue
+            if rng < MIN_RANGE_PCT:
+                log_skip(
+                    sym,
+                    f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}",
+                    feat,
+                )
+                continue
 
-            # choose best symbol
+            # ---------------- PICK BEST SYMBOL ----------------
             if score > best_score:
                 best_score = score
                 best_sym = sym
                 best_feat = feat
 
+        # No valid trade this loop
         if not best_sym or not best_feat:
             await self.maybe_heartbeat()
             return
 
-        # tiny anti-spam: don't double-trigger same symbol in <0.5s
+        # Tiny anti-spam: don't double-trigger same symbol in <0.5s
         if now - self.mkt.last_signal_ts[best_sym] < 0.5:
             return
         self.mkt.last_signal_ts[best_sym] = now
@@ -578,14 +603,16 @@ if rng < MIN_RANGE_PCT:
         imb = feat["imbalance"]
         burst = feat["burst"]
 
-        side: Optional[str] = None
+        # -------- Direction (long / short) --------
         if imb > 0 and burst > 0:
             side = "buy"
         elif imb < 0 and burst < 0:
             side = "sell"
         else:
+            log_skip(sym_ws, "mixed signals (imbalance & burst disagree)", feat)
             return
 
+        # -------- Position sizing --------
         notional = equity * EQUITY_USE_FRACTION * LEVERAGE
         if mid <= 0:
             return
@@ -593,21 +620,22 @@ if rng < MIN_RANGE_PCT:
 
         min_qty = MIN_QTY_MAP.get(sym_ws, 0.0)
         if qty < min_qty:
+            log_skip(sym_ws, f"qty {qty:.6f} < min_qty {min_qty}", feat)
             return
 
         # round qty down to 3 decimals
         qty = math.floor(qty * 1000) / 1000.0
         if qty <= 0:
+            log_skip(sym_ws, "qty rounded down to 0", feat)
             return
 
-        # ---------------- DYNAMIC TP SYSTEM ----------------
+        # -------- DYNAMIC TP SYSTEM --------
         score_tp = choose_dynamic_tp(
             feat["imbalance"],
             feat["burst"],
             feat["spread"],
             feat["range_pct"],
         )
-
         sl_pct = SL_PCT
 
         if side == "buy":
@@ -617,7 +645,7 @@ if rng < MIN_RANGE_PCT:
             tp_price = mid * (1.0 - score_tp)
             sl_price = mid * (1.0 + sl_pct)
 
-        # ENTRY: market order (simple + reliable)
+        # -------- ENTRY: market order (simple + reliable) --------
         try:
             order = await self.exchange.create_market_order(
                 sym_ws, side, qty, reduce_only=False
@@ -630,7 +658,7 @@ if rng < MIN_RANGE_PCT:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
-        # TP as limit reduce-only maker
+        # -------- TP as limit reduce-only maker --------
         opp_side = "sell" if side == "buy" else "buy"
         try:
             await self.exchange.create_limit_order(
@@ -645,6 +673,7 @@ if rng < MIN_RANGE_PCT:
             print(f"[TP ERROR] {sym_ws}: {e}")
             await send_telegram(f"⚠️ TP order placement failed for {sym_ws}")
 
+        # -------- Save position state --------
         self.position = Position(
             symbol_ws=sym_ws,
             side=side,
@@ -660,8 +689,8 @@ if rng < MIN_RANGE_PCT:
             f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
         await send_telegram(
-            f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
+            f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} "
+            f"entry={entry_price:.4f} TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
 
     async def watchdog_position(self):
@@ -670,6 +699,7 @@ if rng < MIN_RANGE_PCT:
         """
         if not self.position:
             return
+
         sym = self.position.symbol_ws
         feat = self.mkt.compute_features(sym)
         if not feat:
@@ -685,6 +715,7 @@ if rng < MIN_RANGE_PCT:
             dd = (mid - pos.entry_price) / pos.entry_price
 
         if dd >= SL_PCT * 1.1:
+            # close position
             await self.exchange.close_position_market(sym)
 
             # log move length for TP learning
@@ -701,7 +732,6 @@ if rng < MIN_RANGE_PCT:
             )
 
             self.position = None
-            return
 
     async def maybe_heartbeat(self):
         """
@@ -712,6 +742,7 @@ if rng < MIN_RANGE_PCT:
             return
         if now - self.last_heartbeat_ts < HEARTBEAT_IDLE_SEC:
             return
+
         self.last_heartbeat_ts = now
         eq = await self.exchange.fetch_equity()
         print(f"[HEARTBEAT] idle, equity={eq:.2f}")
