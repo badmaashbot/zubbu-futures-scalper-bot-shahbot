@@ -39,6 +39,16 @@ move_analyzer = MoveAnalyzer()
 import aiohttp
 import ccxt  # sync ccxt, we will wrap blocking calls with asyncio.to_thread
 
+def log_skip(sym: str, reason: str, feat: dict):
+    print(
+        f"[SKIP] {sym}: {reason} | "
+        f"spread={feat.get('spread',0):.6f}, "
+        f"imb={feat.get('imbalance',0):.4f}, "
+        f"burst={feat.get('burst',0):.4f}, "
+        f"range={feat.get('range_pct',0):.6f}",
+        flush=True
+    )
+
 # --------- DEBUG SKIP LOGGER ---------
 def log_skip(sym, reason, feat):
     print(f"[SKIP] {sym}: {reason} | mid={feat.get('mid'):.5f} "
@@ -538,41 +548,26 @@ class ScalperBot:
             rng = feat["range_pct"]
 
             # ----- SCORE (impulse strength) -----
-            score = abs(imb) * abs(burst) / max(spread, 1e-6)
+score = abs(imb) * abs(burst) / max(spread, 1e-6)
+if score < SCORE_MIN:
+    log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
+    continue
 
-            # ----- FILTERS WITH DEBUG LOGS -----
-            if score < SCORE_MIN:
-                log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
-                continue
+if spread <= 0 or spread > MAX_SPREAD:
+    log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
+    continue
 
-            if spread <= 0 or spread > MAX_SPREAD:
-                log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
-                continue
+if abs(imb) < IMBALANCE_THRESH:
+    log_skip(sym, f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
+    continue
 
-            if abs(imb) < IMBALANCE_THRESH:
-                log_skip(
-                    sym,
-                    f"imbalance {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}",
-                    feat,
-                )
-                continue
+if abs(burst) < BURST_THRESH:
+    log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
+    continue
 
-            if abs(burst) < BURST_THRESH:
-                log_skip(
-                    sym,
-                    f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}",
-                    feat,
-                )
-                continue
-
-            if rng < MIN_RANGE_PCT:
-                log_skip(
-                    sym,
-                    f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}",
-                    feat,
-                )
-                continue
-
+if rng < MIN_RANGE_PCT:
+    log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
+    continue
             # ----- CHOOSE BEST SYMBOL -----
             if score > best_score:
                 best_score = score
