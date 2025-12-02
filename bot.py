@@ -553,7 +553,7 @@ class ScalperBot:
             # ----- SCORE (impulse strength) -----
             score = abs(imb) * abs(burst) / max(spread, 1e-6)
 
-            # ----- FILTERS + DEBUG SKIPS -----
+            # ----- FILTERS WITH DEBUG LOGGING -----
             if score < SCORE_MIN:
                 log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
                 continue
@@ -574,23 +574,24 @@ class ScalperBot:
                 log_skip(sym, f"range {rng:.6f} < MIN_RANGE_PCT {MIN_RANGE_PCT}", feat)
                 continue
 
-            # ----- CHOOSE BEST SYMBOL -----
+            # ----- PICK THE STRONGEST SYMBOL -----
             if score > best_score:
                 best_score = score
                 best_sym = sym
                 best_feat = feat
 
+        # If nothing passed filters → heartbeat
         if not best_sym or not best_feat:
             await self.maybe_heartbeat()
             return
 
-        # tiny anti-spam: don't double-trigger same symbol in <0.5s
+        # tiny anti-spam: prevent double triggers
         if now - self.mkt.last_signal_ts[best_sym] < 0.5:
             return
         self.mkt.last_signal_ts[best_sym] = now
 
         await self.open_position(best_sym, best_feat)
-
+        
     async def open_position(self, sym_ws: str, feat: dict):
         """
         Open a new position with dynamic TP and fixed SL.
