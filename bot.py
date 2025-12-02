@@ -924,7 +924,7 @@ async def main():
         target=debug_console, args=(mkt, bot), daemon=True
     ).start()
 
-    await bot.init_equity_and_leverage()
+await bot.init_equity_and_leverage()
 
     ws_task = asyncio.create_task(ws_loop(mkt))
 
