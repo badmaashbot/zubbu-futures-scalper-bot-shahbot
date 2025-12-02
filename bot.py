@@ -928,19 +928,21 @@ await bot.init_equity_and_leverage()
 
 ws_task = asyncio.create_task(ws_loop(mkt))
 
+try:
+    while True:
+        await bot.maybe_kill_switch()
+        await bot.eval_symbols_and_maybe_enter()
+        await bot.watchdog_position()
+        await asyncio.sleep(1.0)
+except Exception as e:
+    logging.exception(">>> FIRST REAL CRASH <<<")
+    raise
+finally:
+    ws_task.cancel()
     try:
-        while True:
-            await bot.maybe_kill_switch()
-            await bot.eval_symbols_and_maybe_enter()
-            await bot.watchdog_position()
-            await asyncio.sleep(1.0)
-    finally:
-        ws_task.cancel()
-        try:
-            await ws_task
-        except Exception:
-            pass
-
+        await ws_task
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     try:
