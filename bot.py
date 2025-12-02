@@ -529,6 +529,23 @@ class ScalperBot:
 
     async def eval_symbols_and_maybe_enter(self):
         """
+
+            # ---------- FORCE ONE TEST TRADE ----------
+    if self.position is None and time.time() % 30 < 1:  # once every 30 s
+        sym = "BTCUSDT"
+        feat = self.mkt.compute_features(sym)
+        if feat:
+            print("[FORCE] entering BTCUSDT with live price")
+            await self.open_position(sym, feat)
+            return
+    # ------------------------------------------
+
+    best_score = -1
+    best_sym = None
+    best_feat = None
+    now = time.time()
+
+    
         Scan all symbols, compute features, pick the best one and open position.
         Only runs when there is NO open position.
         """
