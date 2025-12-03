@@ -657,116 +657,128 @@ class MarketState:
         self.trades: Dict[str, deque] = {s: deque(maxlen=1000) for s in SYMBOLS_WS}
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
-# -------- ORDERBOOK UPDATE (100% correct Bybit V5 + legacy support) --------
-def update_book(self, symbol: str, data: dict):
-    """
-    Correct parser for Bybit V5 "orderbook.1.<symbol>" stream.
-    Supports:
-      - NEW format: {"b": [...], "a": [...], "ts": ...}
-      - DELTA updates where b/a contain qty 0 (delete) or qty>0 (update)
-      - OLD format fallback: {"type": "snapshot"/"delta", "bids": [...], "asks": [...]}
-    """
+    # -------- ORDERBOOK UPDATE (100% correct Bybit V5 + legacy support) --------
+    def update_book(self, symbol: str, data: dict):
+        """
+        Correct parser for Bybit V5 "orderbook.1.<symbol>" stream.
+        Supports:
+          - NEW format: {"b": [...], "a": [...], "ts": ...}
+          - DELTA updates (b/a with qty=0 or qty>0)
+          - OLD format fallback: {"type": "snapshot"/"delta", "bids": [...], "asks": [...]}
+        """
 
-    book = self.books[symbol]
+        book = self.books[symbol]
 
-    # ---------------------------
-    # NEW BYBIT V5 FORMAT
-    # ---------------------------
-    if isinstance(data, dict) and ("b" in data or "a" in data):
+        # ---------------------------
+        # NEW BYBIT V5 FORMAT (b / a)
+        # ---------------------------
+        if isinstance(data, dict) and ("b" in data or "a" in data):
 
-        # Timestamp update
-        ts_raw = data.get("ts") or data.get("t") or (time.time() * 1000)
-        book["ts"] = safe_float(ts_raw, time.time()) / 1000.0
+            # Timestamp update
+            ts_raw = data.get("ts") or data.get("t") or (time.time() * 1000)
+            book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
 
-        # If BOTH b and a present → SNAPSHOT REFRESH
-        if "b" in data and "a" in data:
+            # If BOTH b and a → FULL SNAPSHOT REFRESH
+            if "b" in data and "a" in data:
+                book["bids"].clear()
+                book["asks"].clear()
+
+                # snapshot bids
+                for px, qty in data.get("b", []):
+                    p = safe_float(px)
+                    q = safe_float(qty)
+                    if p and q and q > 0:
+                        book["bids"][p] = q
+
+                # snapshot asks
+                for px, qty in data.get("a", []):
+                    p = safe_float(px)
+                    q = safe_float(qty)
+                    if p and q and q > 0:
+                        book["asks"][p] = q
+
+                return  # finished snapshot
+
+            # DELTA UPDATE (only b or only a)
+            if "b" in data:
+                for px, qty in data.get("b", []):
+                    p = safe_float(px)
+                    q = safe_float(qty)
+                    if not p:
+                        continue
+                    if q == 0:
+                        book["bids"].pop(p, None)
+                    else:
+                        book["bids"][p] = q
+
+            if "a" in data:
+                for px, qty in data.get("a", []):
+                    p = safe_float(px)
+                    q = safe_float(qty)
+                    if not p:
+                        continue
+                    if q == 0:
+                        book["asks"].pop(p, None)
+                    else:
+                        book["asks"][p] = q
+
+            return  # finished delta update
+
+        # ---------------------------
+        # LEGACY FORMAT (FALLBACK)
+        # ---------------------------
+        ts_raw = data.get("ts", time.time() * 1000)
+        book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
+
+        typ = data.get("type")
+
+        # Legacy snapshot
+        if typ == "snapshot":
             book["bids"].clear()
             book["asks"].clear()
 
-            # snapshot bids
-            for px, qty in data.get("b", []):
-                p = safe_float(px)
-                q = safe_float(qty)
+            for px, qty in data.get("bids", []):
+                p = safe_float(px); q = safe_float(qty)
                 if p and q:
                     book["bids"][p] = q
 
-            # snapshot asks
-            for px, qty in data.get("a", []):
-                p = safe_float(px)
-                q = safe_float(qty)
+            for px, qty in data.get("asks", []):
+                p = safe_float(px); q = safe_float(qty)
                 if p and q:
                     book["asks"][p] = q
 
             return
 
-        # If only "b" or only "a" → DELTA update
-        if "b" in data:
-            for px, qty in data["b"]:
-                p = safe_float(px)
-                q = safe_float(qty)
-                if not p:
-                    continue
-                if q == 0:
-                    book["bids"].pop(p, None)
-                else:
-                    book["bids"][p] = q
+        # Legacy delta (delete/update/insert)
+        for key in ("delete", "update", "insert"):
+            part = data.get(key, {})
+            for px, qty in part.get("bids", []):
+                p = safe_float(px); q = safe_float(qty)
+                if p:
+                    if q == 0:
+                        book["bids"].pop(p, None)
+                    else:
+                        book["bids"][p] = q
 
-        if "a" in data:
-            for px, qty in data["a"]:
-                p = safe_float(px)
-                q = safe_float(qty)
-                if not p:
-                    continue
-                if q == 0:
-                    book["asks"].pop(p, None)
-                else:
-                    book["asks"][p] = q
+            for px, qty in part.get("asks", []):
+                p = safe_float(px); q = safe_float(qty)
+                if p:
+                    if q == 0:
+                        book["asks"].pop(p, None)
+                    else:
+                        book["asks"][p] = q
 
-        return
-
-    # ---------------------------
-    # LEGACY FORMAT (FALLBACK)
-    # ---------------------------
-    ts_raw = data.get("ts")
-    book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
-
-    typ = data.get("type")
-    if typ == "snapshot":
-        book["bids"].clear()
-        book["asks"].clear()
-        for px, qty in data.get("bids", []):
-            p = safe_float(px); q = safe_float(qty)
-            if p and q:
-                book["bids"][p] = q
-        for px, qty in data.get("asks", []):
-            p = safe_float(px); q = safe_float(qty)
-            if p and q:
-                book["asks"][p] = q
-        return
-
-    # delta update for legacy
-    for key in ("delete", "update", "insert"):
-        part = data.get(key, {})
-        for px, qty in part.get("bids", []):
-            p = safe_float(px); q = safe_float(qty)
-            if p:
-                if q == 0:
-                    book["bids"].pop(p, None)
-                else:
-                    book["bids"][p] = q
-        for px, qty in part.get("asks", []):
-            p = safe_float(px); q = safe_float(qty)
-            if p:
-                if q == 0:
-                    book["asks"].pop(p, None)
-                else:
-                    book["asks"][p] = q
-
+    # -------------------------------------------------------------------
+    #                           TRADE STORAGE
+    # -------------------------------------------------------------------
     def add_trade(self, symbol: str, trade: dict):
-        # trade: {price, size, side, ts}
+        """Store trade: {price, size, side, ts}"""
         self.trades[symbol].append(trade)
 
-    def get_best_bid_ask(self, symbol: str) -> Optional[Tuple[float, float]]:
+    # -------------------------------------------------------------------
+    #                       GET BEST BID / ASK
+    # -------------------------------------------------------------------
+    def get_best_bid_ask(self, symbol: str):
         book = self.books[symbol]
         if not book["bids"] or not book["asks"]:
             return None
@@ -774,24 +786,31 @@ def update_book(self, symbol: str, data: dict):
         best_ask = min(book["asks"].keys())
         return best_bid, best_ask
 
-    def compute_features(self, symbol: str) -> Optional[dict]:
+    # -------------------------------------------------------------------
+    #                     COMPUTE FEATURES (imbalance, burst, etc.)
+    # -------------------------------------------------------------------
+    def compute_features(self, symbol: str):
         """
-        Compute mid, spread, imbalance, burst, micro-range for decision engine.
-        Returns None if book/trades are not usable.
+        Compute mid, spread, imbalance, burst, micro-range.
+        Returns None if unusable.
         """
         book = self.books[symbol]
         if not book["bids"] or not book["asks"]:
             return None
+
         now = time.time()
         if now - book["ts"] > BOOK_STALE_SEC:
             return None
 
+        # Top 5 levels
         bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
         asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
+
         bid_vol = sum(q for _, q in bids_sorted)
         ask_vol = sum(q for _, q in asks_sorted)
         if bid_vol + ask_vol == 0:
             return None
+
         imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
         best_bid = bids_sorted[0][0]
@@ -799,32 +818,33 @@ def update_book(self, symbol: str, data: dict):
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
             return None
+
         spread = (best_ask - best_bid) / mid
 
-        # recent burst from trades (last RECENT_TRADE_WINDOW seconds)
+        # Burst calc from trades
         cutoff = now - RECENT_TRADE_WINDOW
         burst = 0.0
+        recent_prices = []
         last_price = None
-        recent_prices: List[float] = []
+
         for t in reversed(self.trades[symbol]):
             if t["ts"] < cutoff:
                 break
-            sz = t["size"]
             if t["side"] == "buy":
-                burst += sz
+                burst += t["size"]
             else:
-                burst -= sz
+                burst -= t["size"]
             last_price = t["price"]
             recent_prices.append(t["price"])
 
         if last_price is None:
             return None
 
-        # micro-range for small volatility check
+        # micro range
         if len(recent_prices) >= 2:
             high = max(recent_prices)
             low = min(recent_prices)
-            rng = (high - low) / mid if mid > 0 else 0.0
+            rng = (high - low) / mid
         else:
             rng = 0.0
 
@@ -835,6 +855,7 @@ def update_book(self, symbol: str, data: dict):
             "burst": burst,
             "range_pct": rng,
         }
+
 
 # =====================================================
 # MOMENTUM & DYNAMIC TP HELPERS
