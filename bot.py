@@ -328,50 +328,87 @@ class MarketState:
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     def update_book(self, symbol: str, data: dict):
-        book = self.books[symbol]
-        ts_raw = data.get("ts")
-        ts = safe_float(ts_raw, time.time() * 1000.0) / 1000.0
-        book["ts"] = ts
+        """
+        Robust Bybit v5 orderbook.1 parser (similar spirit to your old one).
 
-        typ = data.get("type")
-        if typ == "snapshot":
-            book["bids"].clear()
-            book["asks"].clear()
-            for px, qty in data.get("bids", []):
-                p = safe_float(px)
-                q = safe_float(qty)
-                if p is None or q is None:
-                    continue
-                book["bids"][p] = q
-            for px, qty in data.get("asks", []):
-                p = safe_float(px)
-                q = safe_float(qty)
-                if p is None or q is None:
-                    continue
-                book["asks"][p] = q
+        We handle:
+        - Snapshot style:  { "s": "BTCUSDT", "b": [...], "a": [...] }
+        - Delta style:     { "b": [...], "a": [...] } with updates only
+        - Also supports "bids"/"asks" keys (just in case).
+
+        Every time we get *any* update, we mark ts = now, so the book is never
+        seen as "2 years old" just because of a weird ts in the payload.
+        """
+        book = self.books[symbol]
+
+        # ✅ ALWAYS mark this book as fresh when an update arrives
+        book["ts"] = time.time()
+
+        # Support both "bids"/"asks" and "b"/"a"
+        bids_key = "bids" if "bids" in data else "b" if "b" in data else None
+        asks_key = "asks" if "asks" in data else "a" if "a" in data else None
+
+        if bids_key is None or asks_key is None:
+            # Nothing useful in this payload
             return
 
-        # incremental
-        for key in ("delete", "update", "insert"):
-            part = data.get(key, {})
-            for px, qty in part.get("bids", []):
+        bids_arr = data.get(bids_key, [])
+        asks_arr = data.get(asks_key, [])
+
+        # Decide when to treat as full snapshot vs incremental.
+        # Rule of thumb:
+        # - If our local book is empty -> treat as snapshot.
+        # - If payload is large (many levels) -> treat as snapshot.
+        # - Otherwise, treat as incremental updates.
+        is_snapshot = False
+        if not book["bids"] and not book["asks"]:
+            is_snapshot = True
+        elif len(bids_arr) + len(asks_arr) > 40:
+            # Large batch → likely a snapshot, rebuild top
+            is_snapshot = True
+
+        if is_snapshot:
+            # 🔄 SNAPSHOT: clear and rebuild
+            book["bids"].clear()
+            book["asks"].clear()
+
+            for px, qty in bids_arr:
                 p = safe_float(px)
                 q = safe_float(qty)
-                if p is None or q is None:
+                if p is None or q is None or q <= 0:
                     continue
-                if q == 0:
-                    book["bids"].pop(p, None)
-                else:
-                    book["bids"][p] = q
-            for px, qty in part.get("asks", []):
+                book["bids"][p] = q
+
+            for px, qty in asks_arr:
                 p = safe_float(px)
                 q = safe_float(qty)
-                if p is None or q is None:
+                if p is None or q is None or q <= 0:
                     continue
-                if q == 0:
-                    book["asks"].pop(p, None)
-                else:
-                    book["asks"][p] = q
+                book["asks"][p] = q
+
+            return
+
+        # 🔁 INCREMENTAL: update existing top of book
+        # Bybit v5 convention: if qty == 0 => remove level
+        for px, qty in bids_arr:
+            p = safe_float(px)
+            q = safe_float(qty)
+            if p is None or q is None:
+                continue
+            if q == 0:
+                book["bids"].pop(p, None)
+            else:
+                book["bids"][p] = q
+
+        for px, qty in asks_arr:
+            p = safe_float(px)
+            q = safe_float(qty)
+            if p is None or q is None:
+                continue
+            if q == 0:
+                book["asks"].pop(p, None)
+            else:
+                book["asks"][p] = q
 
     def add_trade(self, symbol: str, trade: dict):
         self.trades[symbol].append(trade)
