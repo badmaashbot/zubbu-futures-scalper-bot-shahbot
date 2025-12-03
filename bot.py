@@ -1001,11 +1001,31 @@ async def ws_loop(mkt: MarketState):
                                 payload = data.get("data")
                                 if not payload:
                                     continue
-                                # Bybit sends array sometimes
-                                if isinstance(payload, list):
-                                    payload = payload[0]
-                                if isinstance(payload, dict):
-                                    mkt.update_book(sym, payload)
+
+                                # -------- ORDERBOOK PARSER FIX FOR NEW BYBIT FORMAT --------
+if isinstance(payload, dict) and "b" in payload and "a" in payload:
+    # NEW SNAPSHOT FORMAT (bids = "b", asks = "a")
+    book = mkt.books[sym]
+    book["bids"].clear()
+    book["asks"].clear()
+
+    for px, qty in payload["b"]:
+        try:
+            book["bids"][float(px)] = float(qty)
+        except:
+            pass
+
+    for px, qty in payload["a"]:
+        try:
+            book["asks"][float(px)] = float(qty)
+        except:
+            pass
+
+    ts_raw = payload.get("ts", time.time()*1000)
+    book["ts"] = float(ts_raw) / 1000.0
+
+    continue
+
 
                             # -------- TRADES ----------
                             elif topic.startswith("publicTrade"):
