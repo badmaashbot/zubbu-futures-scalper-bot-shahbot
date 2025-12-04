@@ -93,18 +93,29 @@ LOCK2_PCT = 0.004   # +0.4% locked when TP1 reached
 TRAIL_START_PCT = 0.010   # start trailing once +1% reached
 TRAIL_LOCK_PCT = 0.007    # keep SL around +0.7% while price higher
 
-# Aggressive impulse filters (NOT ultra-strict)
-MAX_SPREAD = 0.0007        # 0.07%
-IMBALANCE_THRESH = 0.04    # ~52/48+
-BURST_THRESH = 0.02        # small but real aggression
-SCORE_MIN = 2.0
-VOL_FILTER = 0.0002        # 0.02% micro-range
+# ===== CONTINUATION FILTERS (MID-RANGE, GOOD FOR TP LADDER) =====
 
-RECENT_TRADE_WINDOW = 0.15  # seconds, for burst
+# Burst window: slightly slower, for smoother continuation
+RECENT_TRADE_WINDOW = 0.30   # 0.30s window for burst
+
+# Burst thresholds (net buy-sell volume in window)
+BURST_STRONG = 0.010
+BURST_MEDIUM = 0.005
+
+# Orderbook imbalance thresholds (top 5 levels)
+IMB_STRONG = 0.008
+IMB_MEDIUM = 0.004
+
+# Microtrend slope thresholds (over last ~20 mids)
+MICROTREND_UP = +0.00008     # +0.008%
+MICROTREND_DOWN = -0.00008   # -0.008%
+
+# Spread safety (relative)
+MAX_SPREAD = 0.0015          # 0.15%
+
 BOOK_STALE_SEC = 6.0
-
-KILL_SWITCH_DD = 0.05       # 5% equity drawdown
-HEARTBEAT_IDLE_SEC = 1800   # 30 minutes
+KILL_SWITCH_DD = 0.05
+HEARTBEAT_IDLE_SEC = 1800
 
 MIN_QTY_MAP = {
     "BTCUSDT": 0.001,
@@ -325,6 +336,10 @@ class MarketState:
         self.trades: Dict[str, Deque[dict]] = {
             s: deque(maxlen=1000) for s in SYMBOLS_WS
         }
+                # mid-price history per symbol for microtrend (last ~20 mids)
+        self.mid_history: Dict[str, Deque[float]] = {
+            s: deque(maxlen=20) for s in SYMBOLS_WS
+        }
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     def update_book(self, symbol: str, data: dict):
@@ -434,6 +449,10 @@ class MarketState:
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
             return None
+
+        # update microtrend mid history
+        self.mid_history[symbol].append(mid)
+
         spread = (best_ask - best_bid) / mid
 
         # trades window
@@ -464,6 +483,21 @@ class MarketState:
             "burst": burst,
             "range_pct": rng,
         }
+
+    def get_micro_slope(self, symbol: str) -> float:
+        """
+        Simple microtrend: slope of last ~20 mids.
+        Positive = up drift, negative = down drift.
+        """
+        arr = self.mid_history[symbol]
+        if len(arr) < 5:
+            return 0.0
+        first = arr[0]
+        last = arr[-1]
+        if first <= 0:
+            return 0.0
+        return (last - first) / first
+
 
 # --------------------------------------------------------------------
 # SCALPER BOT CORE
@@ -507,6 +541,12 @@ class ScalperBot:
             raise SystemExit("Kill-switch triggered")
 
     async def eval_symbols_and_maybe_enter(self):
+        """
+        Mid-speed continuation entry:
+
+        - Uses burst (aggression), imbalance (pressure), and microtrend (drift)
+        - Target is 0.4–1.0% ladder TP, not ultra-fast HFT spikes
+        """
         if self.position is not None:
             return
 
@@ -526,40 +566,41 @@ class ScalperBot:
             burst = feat["burst"]
             rng = feat["range_pct"]
 
-            # basic checks
+            # -------- basic spread safety --------
             if spread <= 0 or spread > MAX_SPREAD:
                 log_skip(sym, f"spread {spread:.6f} > MAX_SPREAD {MAX_SPREAD}", feat)
                 continue
 
-            if abs(imb) < IMBALANCE_THRESH:
-                log_skip(sym, f"imb {imb:.4f} < IMBALANCE_THRESH {IMBALANCE_THRESH}", feat)
+            # -------- burst / imbalance strength (medium or strong) --------
+            abs_burst = abs(burst)
+            abs_imb = abs(imb)
+
+            if abs_burst < BURST_MEDIUM:
+                log_skip(sym, f"burst {burst:.4f} < BURST_MEDIUM {BURST_MEDIUM}", feat)
                 continue
 
-            if abs(burst) < BURST_THRESH:
-                log_skip(sym, f"burst {burst:.4f} < BURST_THRESH {BURST_THRESH}", feat)
+            if abs_imb < IMB_MEDIUM:
+                log_skip(sym, f"imb {imb:.4f} < IMB_MEDIUM {IMB_MEDIUM}", feat)
                 continue
 
-            if rng < VOL_FILTER:
-                log_skip(sym, f"range {rng:.6f} < VOL_FILTER {VOL_FILTER}", feat)
-                continue
+            # -------- microtrend slope (slow–medium drift) --------
+            slope = self.mkt.get_micro_slope(sym)
+            trend_up = slope >= MICROTREND_UP
+            trend_down = slope <= MICROTREND_DOWN
 
-            # direction consistency
-            if (imb > 0 and burst > 0):
+            # require direction agreement: burst, imbalance, and microtrend
+            dir_ok = False
+            if imb > 0 and burst > 0 and trend_up:
                 dir_ok = True
-            elif (imb < 0 and burst < 0):
+            elif imb < 0 and burst < 0 and trend_down:
                 dir_ok = True
-            else:
-                dir_ok = False
 
             if not dir_ok:
-                log_skip(sym, "direction mismatch (imb*burst <= 0)", feat)
+                log_skip(sym, "direction/microtrend mismatch", feat)
                 continue
 
-            # simple impulse score
-            score = (abs(imb) + abs(burst)) / max(spread, 1e-6)
-            if score < SCORE_MIN:
-                log_skip(sym, f"score {score:.3f} < SCORE_MIN {SCORE_MIN}", feat)
-                continue
+            # simple score to pick strongest symbol
+            score = abs_burst + abs_imb + abs(slope) * 1000.0 + rng * 1000.0
 
             if score > best_score:
                 best_score = score
@@ -570,13 +611,14 @@ class ScalperBot:
             await self.maybe_heartbeat()
             return
 
-        # anti-spam
+        # anti-spam per-symbol
         if now - self.mkt.last_signal_ts[best_sym] < 0.5:
             return
         self.mkt.last_signal_ts[best_sym] = now
 
         await self.open_position(best_sym, best_feat)
 
+    
     async def open_position(self, sym_ws: str, feat: dict):
         try:
             equity = await self.exchange.fetch_equity()
