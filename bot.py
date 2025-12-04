@@ -453,7 +453,7 @@ class MarketState:
         # update microtrend mid history
         self.mid_history[symbol].append(mid)
 
-        spread = (best_ask - best_bid) / mid
+        spread = abs(best_ask - best_bid) / mid
 
         # trades window
         cutoff = now - RECENT_TRADE_WINDOW
