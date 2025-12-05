@@ -300,13 +300,17 @@ class Position:
 class MarketState:
     """
     Holds orderbook + trades for all symbols, updated from WS.
+    Uses L2 book (bids/asks dicts) + recent trades deque.
     """
 
     def __init__(self):
+        # orderbook: simple L2 snapshot for each symbol
         self.books: Dict[str, dict] = {
             s: {"bids": {}, "asks": {}, "ts": 0.0} for s in SYMBOLS_WS
         }
+        # recent trades for each symbol (WS trade stream)
         self.trades: Dict[str, deque] = {s: deque(maxlen=2000) for s in SYMBOLS_WS}
+        # anti-spam: last time we sent a signal per symbol
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     # -------- ORDERBOOK UPDATE (Bybit V5 + legacy) --------
@@ -407,7 +411,14 @@ class MarketState:
                         book["asks"][p] = q
 
     def add_trade(self, symbol: str, trade: dict):
-        # trade: {price, size, side, ts}
+        """
+        Append one WS trade.
+        Expected keys (from your WS parser):
+            trade["price"]  - float
+            trade["size"]   - float (base qty)
+            trade["side"]   - "Buy"/"Sell" or "buy"/"sell"
+            trade["ts"]     - unix seconds
+        """
         self.trades[symbol].append(trade)
 
     def get_best_bid_ask(self, symbol: str) -> Optional[Tuple[float, float]]:
@@ -420,67 +431,76 @@ class MarketState:
 
     def compute_features(self, sym: str) -> Optional[dict]:
         """
-        Convert live L2 signals into:
-            - imbalance
-            - spread
-            - burst accumulation & micro bursts
-            - burst strength (helps avoid fake spikes)
-            - local micro volatility (range_pct)
-            - mid-price
+        Convert live L2 signals into compact features:
+            - imbalance (top-of-book volume diff)
+            - spread (relative)
+            - accumulation burst (last ACCUM_BURST_WINDOW)
+            - micro burst (last MICRO_BURST_WINDOW)
+            - burst_strength = |accum_burst| / ACCUM_BURST_WINDOW
+            - range_pct (volatility of last RECENT_TRADE_WINDOW)
+            - mid price
         """
-
-        data = self.data.get(sym)
-        if not data:
+        # ----- mid & spread from orderbook -----
+        best = self.get_best_bid_ask(sym)
+        if not best:
             return None
-
-        ob = data.get("orderbook")
-        if not ob:
-            return None
-
-        bids = ob.get("bids", [])
-        asks = ob.get("asks", [])
-        if not bids or not asks:
-            return None
-
-        # mid price & spread
-        best_bid = bids[0][0]
-        best_ask = asks[0][0]
+        best_bid, best_ask = best
         if best_bid <= 0 or best_ask <= 0:
             return None
 
-        mid = (best_bid + best_ask) / 2
+        mid = (best_bid + best_ask) / 2.0
         spread = (best_ask - best_bid) / mid
 
-        # -------------- imbalance calculation --------------
-        b_sz = sum(sz for p, sz in bids[:5])
-        a_sz = sum(sz for p, sz in asks[:5])
-        total = b_sz + a_sz
-        if total <= 0:
-            return None
-        imbalance = (b_sz - a_sz) / total
+        # imbalance from top 5 levels on each side
+        book = self.books[sym]
+        bids_sorted = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:5]
+        asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
 
-        # -------------- accumulation burst -----------------
-        trades = data.get("trades", [])
+        bid_vol = sum(q for _, q in bids_sorted)
+        ask_vol = sum(q for _, q in asks_sorted)
+        total_vol = bid_vol + ask_vol
+        if total_vol <= 0:
+            return None
+        imbalance = (bid_vol - ask_vol) / total_vol
+
+        # ----- bursts & volatility from trades -----
+        trades = list(self.trades[sym])
+        if not trades:
+            return None
+
         now = time.time()
-        cutoff = now - ACCUM_BURST_WINDOW
-        recent = [(ts, side, sz) for ts, side, sz in trades if ts >= cutoff]
+        cutoff_accum = now - ACCUM_BURST_WINDOW
+        cutoff_micro = now - MICRO_BURST_WINDOW
+        cutoff_range = now - RECENT_TRADE_WINDOW
 
         accum_burst = 0.0
         micro_burst = 0.0
-        cutoff_micro = now - MICRO_BURST_WINDOW
-        recent_prices = []
+        recent_prices: list[float] = []
 
-        for ts, side, sz in recent:
-            side_mult = 1 if side == "buy" else -1
-            accum_burst += side_mult * sz
+        for t in trades:
+            ts = safe_float(t.get("ts"))
+            if not ts:
+                continue
+
+            side_str = str(t.get("side", "")).lower()
+            sz = safe_float(t.get("size") or t.get("qty") or t.get("sz"))
+            price = safe_float(t.get("price") or t.get("p"))
+            if not sz or not price:
+                continue
+
+            # +1 for buy, -1 for sell
+            side_mult = 1.0 if "buy" in side_str else -1.0
+
+            if ts >= cutoff_accum:
+                accum_burst += side_mult * sz
             if ts >= cutoff_micro:
                 micro_burst += side_mult * sz
-            recent_prices.append(ob["price"])
+            if ts >= cutoff_range:
+                recent_prices.append(price)
 
         if not recent_prices:
             return None
 
-        # micro volatility range pct
         if len(recent_prices) >= 2:
             hi = max(recent_prices)
             lo = min(recent_prices)
@@ -488,20 +508,19 @@ class MarketState:
         else:
             rng = 0.0
 
-        # sustained burst strength (NEW FILTER)
-        burst_strength = 0.0
-        if ACCUM_BURST_WINDOW > 0:
-            burst_strength = abs(accum_burst) / ACCUM_BURST_WINDOW
+        # sustained burst strength
+        burst_strength = abs(accum_burst) / max(ACCUM_BURST_WINDOW, 1e-6)
 
         return {
             "mid": mid,
             "spread": spread,
             "imbalance": imbalance,
-            "burst": accum_burst,
-            "burst_micro": micro_burst,
+            "burst": accum_burst,         # main burst for score
+            "burst_micro": micro_burst,   # confirmation burst
             "burst_strength": burst_strength,
-            "range_pct": rng
+            "range_pct": rng,
         }
+
 
 # =====================================================
 # MOMENTUM & DYNAMIC TP HELPERS
