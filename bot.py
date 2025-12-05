@@ -950,7 +950,7 @@ class ScalperBot:
         if not self.position:
             return
         sym = self.position.symbol_ws
-        feat = self.compute_features(sym)
+        feat = self.mkt.compute_features(sym)
         if not feat:
             return
         mid = feat["mid"]
