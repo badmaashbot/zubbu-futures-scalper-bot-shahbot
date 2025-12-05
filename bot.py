@@ -722,31 +722,31 @@ class ScalperBot:
             ctx_1m = self._get_1m_context(sym)
             ctx_5m = self._get_5m_trend(sym)
 
-# ---------------- BASIC FILTERS ----------------
-if spread <= 0 or spread > MAX_SPREAD:
-    self._log_skip(sym, "spread", feat, f"> MAX_SPREAD({MAX_SPREAD})")
-    continue
-if rng < MIN_RANGE_PCT:
-    self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})")
-    continue
+            # ---------------- BASIC FILTERS ----------------
+            if spread <= 0 or spread > MAX_SPREAD:
+                self._log_skip(sym, "spread", feat, f"> MAX_SPREAD({MAX_SPREAD})")
+                continue
+            if rng < MIN_RANGE_PCT:
+                self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})")
+                continue
 
-# imbalance strength
-if abs(imb) < IMBALANCE_THRESH:
-    self._log_skip(sym, "imbalance", feat, f"< {IMBALANCE_THRESH}")
-    continue
+            # imbalance strength
+            if abs(imb) < IMBALANCE_THRESH:
+                self._log_skip(sym, "imbalance", feat, f"< {IMBALANCE_THRESH}")
+                continue
 
-# burst confirmation: accumulation + micro
-if abs(burst) < BURST_THRESH:
-    self._log_skip(sym, "burst_accum", feat, f"< {BURST_THRESH}")
-    continue
-if abs(b_micro) < BURST_THRESH:
-    self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
-    continue
+            # burst confirmation: accumulation + micro
+            if abs(burst) < BURST_THRESH:
+                self._log_skip(sym, "burst_accum", feat, f"< {BURST_THRESH}")
+                continue
+            if abs(b_micro) < BURST_THRESH:
+                self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
+                continue
 
-# sustained burst accumulation check
-if abs(burst_strength) < BURST_ACCUM_MIN:
-    self._log_skip(sym, "sustained burst missing", feat)
-    continue
+            # sustained burst confirmation (avoid fake spikes)
+            if feat["burst_strength"] < 1.15:
+                self._log_skip(sym, "sustained burst missing", feat)
+                continue
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
             if imb > 0 and burst > 0 and b_micro > 0:
@@ -1048,7 +1048,6 @@ if abs(burst_strength) < BURST_ACCUM_MIN:
         await send_telegram(
             f"💤 Bot idle {HEARTBEAT_IDLE_SEC/60:.0f} min. Equity={eq:.2f} USDT"
         )
-
 
 # --------------- WEBSOCKET LOOP -----------------
 
