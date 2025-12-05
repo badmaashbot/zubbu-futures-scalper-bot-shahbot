@@ -83,6 +83,7 @@ SL_PCT = 0.0035  # 0.35%
 SCORE_MIN        = 0.42     # was 0.55
 IMBALANCE_THRESH = 0.013    # was 0.020
 BURST_THRESH     = 0.018    # was 0.030
+BURST_ACCUM_MIN = 1.25   # sustained orderflow burst requirement
 MAX_SPREAD       = 0.0015   # a bit looser spread (was 0.0012)
 MIN_RANGE_PCT    = 0.00004  # was 0.00012  (accepts slower 0.4–1% moves)
 
