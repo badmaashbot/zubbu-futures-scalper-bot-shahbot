@@ -717,7 +717,7 @@ class ScalperBot:
         now = time.time()
 
         for sym in SYMBOLS_WS:
-            feat = self.mkt.compute_features(sym)
+            feat = self.compute_features(sym)
             if not feat:
                 continue
 
