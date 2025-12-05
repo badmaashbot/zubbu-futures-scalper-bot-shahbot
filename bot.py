@@ -745,8 +745,8 @@ class ScalperBot:
                 continue
 
             if abs(burst_strength) < BURST_ACCUM_MIN:
-    self._log_skip(sym, "sustained burst missing", feat)
-    return
+        self._log_skip(sym, "sustained burst missing", feat)
+        return
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
             if imb > 0 and burst > 0 and b_micro > 0:
