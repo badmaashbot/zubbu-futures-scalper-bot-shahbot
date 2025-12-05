@@ -735,10 +735,10 @@ class ScalperBot:
             # burst confirmation: accumulation + micro
             if abs(burst) < BURST_THRESH:
                   
-                self._log_skip(sym, "burst_accum", feat, f"< {BURST_ACCUM_MIN}")
+                self._log_skip(sym, "burst_accum", feat, f"< {BURST_THRESH}")
                 continue
-            if abs(b_micro) < BURST_MICRO_MIN:
-                self._log_skip(sym, "burst_micro", feat, f"< {BURST_MICRO_MIN}")
+            if abs(b_micro) < BURST_THRESH:
+                self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
                 continue
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
