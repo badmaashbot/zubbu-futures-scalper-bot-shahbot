@@ -900,10 +900,14 @@ class ScalperBot:
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
             f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
-        # Force entry alert (no suppression)
-global _last_tg_ts
-_last_tg_ts = 0
+        await send_telegram(
+            f"🚀 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
+            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
+
+        # Force entry alert (reset suppression timestamp)
+        global _last_tg_ts
+        _last_tg_ts = 0
 
     # -------------------------------------------------
     # risk watchdog (dynamic SL ladder)
