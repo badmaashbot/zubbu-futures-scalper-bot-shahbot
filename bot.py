@@ -69,11 +69,11 @@ EQUITY_USE_FRACTION = 0.95
 SL_PCT = 0.0035  # 0.35% default hard SL (client-side watchdog)
 
 # --- Orderflow filters (balanced–aggressive / Option-B) ---
-SCORE_MIN        = 0.75
+SCORE_MIN        = 0.55
 IMBALANCE_THRESH = 0.020
 BURST_THRESH     = 0.030
 MAX_SPREAD       = 0.0012
-MIN_RANGE_PCT    = 0.00025
+MIN_RANGE_PCT    = 0.00012
 
 # Market data timing
 RECENT_TRADE_WINDOW = 0.35     # 350 ms burst window
