@@ -744,10 +744,9 @@ class ScalperBot:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
                 continue
 
-            # sustained burst confirmation (avoid fake spikes)
-            if feat["burst_strength"] < 1.15:
-            self._log_skip(sym, "sustained burst missing", feat)
-            continue
+           if abs(burst_strength) < BURST_ACCUM_MIN:
+    self._log_skip(sym, "sustained burst missing", feat)
+    return
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
             if imb > 0 and burst > 0 and b_micro > 0:
