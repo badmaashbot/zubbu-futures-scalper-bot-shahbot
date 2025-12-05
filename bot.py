@@ -429,94 +429,80 @@ class MarketState:
         best_ask = min(book["asks"].keys())
         return best_bid, best_ask
 
-    def compute_features(self, sym: str) -> Optional[dict]:
+    def compute_features(self, symbol: str) -> Optional[dict]:
         """
-        Convert live L2 signals into compact features:
-            - imbalance (top-of-book volume diff)
-            - spread (relative)
-            - accumulation burst (last ACCUM_BURST_WINDOW)
-            - micro burst (last MICRO_BURST_WINDOW)
-            - burst_strength = |accum_burst| / ACCUM_BURST_WINDOW
-            - range_pct (volatility of last RECENT_TRADE_WINDOW)
-            - mid price
+        Compute mid, spread, imbalance, bursts and micro-range for decision engine.
+        Returns None if book/trades are not usable.
         """
-        # ----- mid & spread from orderbook -----
-        best = self.get_best_bid_ask(sym)
-        if not best:
-            return None
-        best_bid, best_ask = best
-        if best_bid <= 0 or best_ask <= 0:
-            return None
-
-        mid = (best_bid + best_ask) / 2.0
-        spread = (best_ask - best_bid) / mid
-
-        # imbalance from top 5 levels on each side
-        book = self.books[sym]
-        bids_sorted = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:5]
-        asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
-
-        bid_vol = sum(q for _, q in bids_sorted)
-        ask_vol = sum(q for _, q in asks_sorted)
-        total_vol = bid_vol + ask_vol
-        if total_vol <= 0:
-            return None
-        imbalance = (bid_vol - ask_vol) / total_vol
-
-        # ----- bursts & volatility from trades -----
-        trades = list(self.trades[sym])
-        if not trades:
+        book = self.books[symbol]
+        if not book["bids"] or not book["asks"]:
             return None
 
         now = time.time()
-        cutoff_accum = now - ACCUM_BURST_WINDOW
-        cutoff_micro = now - MICRO_BURST_WINDOW
-        cutoff_range = now - RECENT_TRADE_WINDOW
+        if now - book["ts"] > BOOK_STALE_SEC:
+            return None
 
-        accum_burst = 0.0
-        micro_burst = 0.0
-        recent_prices: list[float] = []
+        # top levels
+        bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
+        asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
+        bid_vol = sum(q for _, q in bids_sorted)
+        ask_vol = sum(q for _, q in asks_sorted)
+        if bid_vol + ask_vol == 0:
+            return None
 
-        for t in trades:
-            ts = safe_float(t.get("ts"))
-            if not ts:
-                continue
+        imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
-            side_str = str(t.get("side", "")).lower()
-            sz = safe_float(t.get("size") or t.get("qty") or t.get("sz"))
-            price = safe_float(t.get("price") or t.get("p"))
-            if not sz or not price:
-                continue
+        best_bid = bids_sorted[0][0]
+        best_ask = asks_sorted[0][0]
+        mid = (best_bid + best_ask) / 2.0
+        if mid <= 0:
+            return None
 
-            # +1 for buy, -1 for sell
-            side_mult = 1.0 if "buy" in side_str else -1.0
+        spread = (best_ask - best_bid) / mid
 
-            if ts >= cutoff_accum:
+        # ---------------- bursts & range ----------------
+        cutoff = now - RECENT_TRADE_WINDOW
+        cutoff_micro = now - ACCUM_BURST_WINDOW  # you already have this constant
+
+        accum_burst = 0.0     # main burst (used in score)
+        micro_burst = 0.0     # short-window confirmation
+        recent_prices: List[float] = []
+
+        for t in reversed(self.trades[symbol]):
+            ts = t["ts"]
+            if ts < cutoff and ts < cutoff_micro:
+                break
+
+            side_mult = 1.0 if t["side"] == "buy" else -1.0
+            sz = t["size"]
+
+            if ts >= cutoff:
                 accum_burst += side_mult * sz
+                recent_prices.append(t["price"])
+
             if ts >= cutoff_micro:
                 micro_burst += side_mult * sz
-            if ts >= cutoff_range:
-                recent_prices.append(price)
 
         if not recent_prices:
             return None
 
         if len(recent_prices) >= 2:
-            hi = max(recent_prices)
-            lo = min(recent_prices)
-            rng = (hi - lo) / mid if mid > 0 else 0.0
+            high = max(recent_prices)
+            low = min(recent_prices)
+            rng = (high - low) / mid if mid > 0 else 0.0
         else:
             rng = 0.0
 
-        # sustained burst strength
-        burst_strength = abs(accum_burst) / max(ACCUM_BURST_WINDOW, 1e-6)
+        # “strength” of burst over the whole window
+        duration = RECENT_TRADE_WINDOW
+        burst_strength = abs(accum_burst) / duration if duration > 0 else 0.0
 
         return {
             "mid": mid,
             "spread": spread,
             "imbalance": imbalance,
-            "burst": accum_burst,         # main burst for score
-            "burst_micro": micro_burst,   # confirmation burst
+            "burst": accum_burst,        # main burst used in score
+            "burst_micro": micro_burst,  # confirmation burst
             "burst_strength": burst_strength,
             "range_pct": rng,
         }
@@ -736,13 +722,14 @@ class ScalperBot:
         now = time.time()
 
         for sym in SYMBOLS_WS:
-            feat = self.compute_features(sym)
+            feat = self.mkt.compute_features(sym)
             if not feat:
                 continue
 
             imb = feat["imbalance"]
-            burst = feat["burst"]          # accumulation burst
-            b_micro = feat["burst_micro"]  # micro burst
+            burst = feat["burst"]              # accumulation burst
+            b_micro = feat["burst_micro"]      # micro burst
+            burst_strength = feat["burst_strength"]
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
@@ -773,9 +760,9 @@ class ScalperBot:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
                 continue
 
-            # sustained burst confirmation (avoid fake spikes)
-            if feat["burst_strength"] < 1.15:
-                self._log_skip(sym, "sustained burst missing", feat)
+            # sustained burst accumulation check
+            if burst_strength < BURST_ACCUM_MIN:
+                self._log_skip(sym, "burst_strength", feat, "sustained burst missing")
                 continue
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
@@ -834,6 +821,7 @@ class ScalperBot:
 
         await self.open_position(best_sym, best_feat, best_side)
 
+    
     # -------------------------------------------------
     # order execution
     # -------------------------------------------------
