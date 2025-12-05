@@ -479,6 +479,9 @@ class MarketState:
         else:
             rng = 0.0
 
+        duration = RECENT_TRADE_WINDOW
+        burst_strength = abs(accum_burst) / duration
+
         return {
             "mid": mid,
             "spread": spread,
@@ -740,6 +743,11 @@ class ScalperBot:
             if abs(b_micro) < BURST_THRESH:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
                 continue
+
+            # sustained burst confirmation (avoid fake spikes)
+            if feat["burst_strength"] < 1.15:
+            self._log_skip(sym, "sustained burst missing", feat)
+            continue
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
             if imb > 0 and burst > 0 and b_micro > 0:
