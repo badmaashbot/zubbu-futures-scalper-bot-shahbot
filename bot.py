@@ -744,7 +744,7 @@ class ScalperBot:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_THRESH}")
                 continue
 
-           if abs(burst_strength) < BURST_ACCUM_MIN:
+            if abs(burst_strength) < BURST_ACCUM_MIN:
     self._log_skip(sym, "sustained burst missing", feat)
     return
 
