@@ -418,84 +418,90 @@ class MarketState:
         best_ask = min(book["asks"].keys())
         return best_bid, best_ask
 
-def compute_features(self, symbol: str) -> Optional[dict]:
-    """
-    Compute mid-price, spread, imbalance, burst accumulation, micro burst,
-    and sustained burst for confirmation.
-    """
-    book = self.books[symbol]
-    if not book["bids"] or not book["asks"]:
-        return None
+    def compute_features(self, sym: str) -> Optional[dict]:
+        """
+        Convert live L2 signals into:
+            - imbalance
+            - spread
+            - burst accumulation & micro bursts
+            - burst strength (helps avoid fake spikes)
+            - local micro volatility (range_pct)
+            - mid-price
+        """
 
-    now = time.time()
-    if now - book["ts"] > BOOK_STALE_SEC:
-        return None
+        data = self.data.get(sym)
+        if not data:
+            return None
 
-    # ---- TOP LEVEL BIDS & ASKS ----
-    bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
-    asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
-    bid_vol = sum(q for _, q in bids_sorted)
-    ask_vol = sum(q for _, q in asks_sorted)
-    if bid_vol + ask_vol == 0:
-        return None
+        ob = data.get("orderbook")
+        if not ob:
+            return None
 
-    imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return None
 
-    best_bid = bids_sorted[0][0]
-    best_ask = asks_sorted[0][0]
-    mid = (best_bid + best_ask) / 2.0
-    if mid <= 0:
-        return None
+        # mid price & spread
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
+        if best_bid <= 0 or best_ask <= 0:
+            return None
 
-    spread = (best_ask - best_bid) / mid
+        mid = (best_bid + best_ask) / 2
+        spread = (best_ask - best_bid) / mid
 
-    # ---- BURST ACCUMULATION ----
-    cutoff_micro = now - RECENT_TRADE_WINDOW
-    cutoff_accum = now - (RECENT_TRADE_WINDOW * 3)
+        # -------------- imbalance calculation --------------
+        b_sz = sum(sz for p, sz in bids[:5])
+        a_sz = sum(sz for p, sz in asks[:5])
+        total = b_sz + a_sz
+        if total <= 0:
+            return None
+        imbalance = (b_sz - a_sz) / total
 
-    burst_micro = 0.0
-    burst_accum = 0.0
-    recent_prices = []
+        # -------------- accumulation burst -----------------
+        trades = data.get("trades", [])
+        now = time.time()
+        cutoff = now - ACCUM_BURST_WINDOW
+        recent = [(ts, side, sz) for ts, side, sz in trades if ts >= cutoff]
 
-    for t in reversed(self.trades[symbol]):
-        ts = t["ts"]
-        if ts >= cutoff_accum:
-            if t["side"] == "buy":
-                burst_accum += t["size"]
-            else:
-                burst_accum -= t["size"]
+        accum_burst = 0.0
+        micro_burst = 0.0
+        cutoff_micro = now - MICRO_BURST_WINDOW
+        recent_prices = []
 
-        if ts >= cutoff_micro:
-            if t["side"] == "buy":
-                burst_micro += t["size"]
-            else:
-                burst_micro -= t["size"]
-            recent_prices.append(t["price"])
+        for ts, side, sz in recent:
+            side_mult = 1 if side == "buy" else -1
+            accum_burst += side_mult * sz
+            if ts >= cutoff_micro:
+                micro_burst += side_mult * sz
+            recent_prices.append(ob["price"])
 
+        if not recent_prices:
+            return None
+
+        # micro volatility range pct
+        if len(recent_prices) >= 2:
+            hi = max(recent_prices)
+            lo = min(recent_prices)
+            rng = (hi - lo) / mid if mid > 0 else 0.0
         else:
-            break
+            rng = 0.0
 
-    # sustained burst
-    duration = RECENT_TRADE_WINDOW
-    burst_strength = abs(burst_accum) / max(duration, 0.001)
+        # sustained burst strength (NEW FILTER)
+        burst_strength = 0.0
+        if ACCUM_BURST_WINDOW > 0:
+            burst_strength = abs(accum_burst) / ACCUM_BURST_WINDOW
 
-    # micro range
-    if len(recent_prices) >= 2:
-        high = max(recent_prices)
-        low = min(recent_prices)
-        range_pct = (high - low) / mid if mid > 0 else 0.0
-    else:
-        range_pct = 0.0
-
-    return {
-        "mid": mid,
-        "spread": spread,
-        "imbalance": imbalance,
-        "burst": burst_accum,
-        "burst_micro": burst_micro,
-        "burst_strength": burst_strength,
-        "range_pct": range_pct,
-    }
+        return {
+            "mid": mid,
+            "spread": spread,
+            "imbalance": imbalance,
+            "burst": accum_burst,
+            "burst_micro": micro_burst,
+            "burst_strength": burst_strength,
+            "range_pct": rng
+        }
 
 # =====================================================
 # MOMENTUM & DYNAMIC TP HELPERS
