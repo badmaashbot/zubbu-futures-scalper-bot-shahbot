@@ -79,16 +79,15 @@ EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notion
 # Base hard SL (safety net) – dynamic SL is on top of this
 SL_PCT = 0.0035  # 0.35%
 
-# --- Orderflow filters (balanced-aggressive, with accumulation) ---
-SCORE_MIN = 0.55          # impulse score threshold
-IMBALANCE_THRESH = 0.020  # 2% imbalance
-BURST_MICRO_MIN = 0.010   # micro burst (0.35s) minimum
-BURST_ACCUM_MIN = 0.030   # accumulation burst (5s) minimum
-MAX_SPREAD = 0.0012       # 0.12% max spread
-MIN_RANGE_PCT = 0.00012   # 0.012% minimum 1s micro range
+# --- Orderflow filters (aggressive but still safe) ---
+SCORE_MIN        = 0.42     # was 0.55
+IMBALANCE_THRESH = 0.013    # was 0.020
+BURST_THRESH     = 0.018    # was 0.030
+MAX_SPREAD       = 0.0015   # a bit looser spread (was 0.0012)
+MIN_RANGE_PCT    = 0.00004  # was 0.00012  (accepts slower 0.4–1% moves)
 
 # Market data timing
-RECENT_TRADE_WINDOW = 0.35   # 350 ms micro burst window
+RECENT_TRADE_WINDOW = 0.55  # 550 ms burst window, more continuation trades
 ACCUM_BURST_WINDOW = 5.0     # 5 second accumulation window
 BOOK_STALE_SEC = 6.0         # ignore orderbook older than 6 seconds
 
