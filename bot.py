@@ -733,7 +733,8 @@ class ScalperBot:
                 continue
 
             # burst confirmation: accumulation + micro
-            if abs(burst) < BURST_ACCUM_MIN:
+            if abs(burst) < BURST_THRESH:
+                  
                 self._log_skip(sym, "burst_accum", feat, f"< {BURST_ACCUM_MIN}")
                 continue
             if abs(b_micro) < BURST_MICRO_MIN:
