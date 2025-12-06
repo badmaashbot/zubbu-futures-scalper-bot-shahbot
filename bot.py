@@ -78,12 +78,12 @@ SL_PCT = 0.0030   # 0.30% hard stop
 TP_PCT = 0.0040   # 0.40% take profit
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
-SCORE_MIN        = 0.55    # impulse score threshold
-IMBALANCE_THRESH = 0.020   # 2% imbalance
-BURST_MICRO_MIN  = 0.010   # micro burst (0.35s) minimum
-BURST_ACCUM_MIN  = 0.030   # accumulation burst (5s) minimum
+SCORE_MIN        = 0.90    # impulse score threshold
+IMBALANCE_THRESH = 0.06   # 2% imbalance
+BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
+BURST_ACCUM_MIN  = 0.060   # accumulation burst (5s) minimum
 MAX_SPREAD       = 0.0012  # 0.12% max spread
-MIN_RANGE_PCT    = 0.00012 # 0.012% minimum micro-range
+MIN_RANGE_PCT    = 0.00020 # 0.012% minimum micro-range
 
 # Market data timing
 RECENT_TRADE_WINDOW = 0.35  # 350 ms micro burst window
