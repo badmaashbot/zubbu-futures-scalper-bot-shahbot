@@ -149,7 +149,6 @@ def safe_float(x, default: Optional[float] = None) -> Optional[float]:
 
 # --------------- EXCHANGE CLIENT (ccxt sync wrapped into async) -----------------
 
-
 class ExchangeClient:
     """
     Thin async wrapper around ccxt.bybit (sync HTTP).
@@ -172,6 +171,7 @@ class ExchangeClient:
             }
         self.client = ccxt.bybit(cfg)
 
+    # ---------------- LEVERAGE ----------------
     async def set_leverage(self, sym_ws: str, lev: int) -> None:
         symbol = SYMBOL_MAP[sym_ws]
 
@@ -185,8 +185,8 @@ class ExchangeClient:
 
         await asyncio.to_thread(_work)
 
+    # ---------------- EQUITY (USDT + PNL) ----------------
     async def fetch_equity(self) -> float:
-        """Wallet balance + unrealized PnL."""
         def _work():
             bal = self.client.fetch_balance()
             total = safe_float(bal.get("USDT", {}).get("total"), 0.0) or 0.0
@@ -201,6 +201,24 @@ class ExchangeClient:
 
         return await asyncio.to_thread(_work)
 
+    # ---------------- GET POSITION SIZE (contracts) ----------------
+    async def get_position_size(self, sym_ws: str) -> float:
+        """Return open contracts qty for symbol (0.0 if flat)."""
+        symbol = SYMBOL_MAP[sym_ws]
+
+        def _work():
+            try:
+                pos = self.client.fetch_positions([symbol])
+                for p in pos:
+                    contracts = safe_float(p.get("contracts"), 0.0) or 0.0
+                    return contracts
+            except Exception:
+                return 0.0
+            return 0.0
+
+        return await asyncio.to_thread(_work)
+
+    # ---------------- MARKET CLOSE ----------------
     async def close_position_market(self, sym_ws: str):
         """Close any open position in given symbol at market."""
         symbol = SYMBOL_MAP[sym_ws]
@@ -225,6 +243,7 @@ class ExchangeClient:
 
         await asyncio.to_thread(_work)
 
+    # ---------------- MARKET ORDER ----------------
     async def create_market_order(
         self, sym_ws: str, side: str, qty: float, reduce_only: bool = False
     ):
@@ -239,6 +258,7 @@ class ExchangeClient:
 
         return await asyncio.to_thread(_work)
 
+    # ---------------- LIMIT ORDER ----------------
     async def create_limit_order(
         self,
         sym_ws: str,
@@ -846,8 +866,8 @@ class ScalperBot:
     # -------------------------------------------------
     async def watchdog_position(self):
         """
-        - Detect if TP or SL hit on exchange (position size = 0)
-        - Backup SL with market close if price crosses SL and still in position
+        - Detect if exchange closed position (TP hit or SL hit)
+        - If still open, apply backup SL check
         """
         if not self.position:
             return
@@ -855,13 +875,15 @@ class ScalperBot:
         pos = self.position
         sym = pos.symbol_ws
 
-        # Check if position still open on exchange
+        # ========== 1) CHECK IF POSITION SIZE OPEN OR CLOSED ==========
         size = await self.exchange.get_position_size(sym)
-        feat = self.mkt.compute_features(sym)
 
-        # ----- EXCHANGE REPORTS POSITION CLOSED -----
+        # If exchange shows no open position -> TP or SL executed
         if size <= 0:
+            # Recompute last move for reason calculation
+            feat = self.mkt.compute_features(sym)
             reason = "unknown"
+
             if feat:
                 mid = feat["mid"]
                 if pos.side == "buy":
@@ -869,56 +891,58 @@ class ScalperBot:
                 else:
                     move = (pos.entry_price - mid) / pos.entry_price
 
+                # Profit or loss detection
                 if move > 0:
-                    reason = "TP/close in profit"
+                    reason = "TP filled (profit)"
                 else:
-                    reason = "SL/close in loss"
+                    reason = "SL filled (loss)"
 
+            # -------- LOG & TELEGRAM --------
             print(
                 f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}"
             )
             await send_telegram(
-                f"🎯 Position closed: {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"({reason})"
+                f"📤 EXIT — {sym} {pos.side.upper()} entry={pos.entry_price:.4f}\n"
+                f"➡️ {reason}"
             )
 
-            if reason.startswith("SL"):
-                self.last_sl_time[sym] = time.time()
-
+            # CLEAR POSITION
             self.position = None
             return
 
-        # We can't backup SL if we don’t have live price
+        # ========== 2) IF STILL OPEN, GET CURRENT PRICE ==========
+        feat = self.mkt.compute_features(sym)
         if not feat:
             return
-
         mid = feat["mid"]
         if mid <= 0:
             return
 
-        # ---- BACKUP SL JUST IN CASE ----
+        # ========== 3) BACKUP SL CHECK ==========
         hit = False
 
-        # For long
-        if pos.side == "buy" and mid <= pos.sl_price * (1.0 - 0.0005):
+        # long backup SL
+        if pos.side == "buy" and mid <= pos.sl_price:
             hit = True
 
-        # For short
-        if pos.side == "sell" and mid >= pos.sl_price * (1.0 + 0.0005):
+        # short backup SL
+        if pos.side == "sell" and mid >= pos.sl_price:
             hit = True
 
         if hit:
+            # Force close market
             await self.exchange.close_position_market(sym)
+
             print(
                 f"[BACKUP SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"SL={pos.sl_price:.4f} now={mid:.4f}"
             )
             await send_telegram(
-                f"🛑 BACKUP SL {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"SL={pos.sl_price:.4f} now={mid:.4f}"
+                f"🛑 BACKUP SL — {sym} {pos.side.upper()}\n"
+                f"Entry={pos.entry_price:.4f}  SL={pos.sl_price:.4f}"
             )
-            self.last_sl_time[sym] = time.time()
+
             self.position = None
             return
 
