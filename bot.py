@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py
+ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (Mode B entry + burst_slope)
 
 Core Logic:
 -----------
@@ -9,7 +9,8 @@ Core Logic:
 - Orderflow engine:
     * imbalance (top 5 levels)
     * micro burst (last 0.35s trades)
-    * accumulation burst (last 5s trades)
+    * accumulation burst (last 1.5s trades)  <-- tightened
+    * burst_slope (acceleration of accum burst)  <-- NEW
     * score = |imbalance| * |accum_burst| / spread
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
@@ -33,7 +34,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP"
+BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP_MODEB"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -74,20 +75,21 @@ LEVERAGE = 3
 EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notional
 
 # Fixed SL / TP (decimal, relative to entry)
-SL_PCT = 0.0030   # 0.30% hard stop
+SL_PCT = 0.0030   # 0.30% hard stop (watchdog)
 TP_PCT = 0.0040   # 0.40% take profit
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
 SCORE_MIN        = 0.90    # impulse score threshold
-IMBALANCE_THRESH = 0.06   # 6% imbalance
+IMBALANCE_THRESH = 0.06    # 6% imbalance
 BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
-BURST_ACCUM_MIN  = 0.060   # accumulation burst (5s) minimum
+BURST_ACCUM_MIN  = 0.060   # accumulation burst minimum
+BURST_SLOPE_MIN  = 0.020   # NEW: minimum acceleration for Mode B
 MAX_SPREAD       = 0.0012  # 0.12% max spread
 MIN_RANGE_PCT    = 0.00020 # 0.012% minimum micro-range
 
 # Market data timing
 RECENT_TRADE_WINDOW = 0.35  # 350 ms micro burst window
-ACCUM_BURST_WINDOW  = 5.0   # 5 second accumulation window
+ACCUM_BURST_WINDOW  = 1.5   # NEW: 1.5s accumulation (faster entries)
 BOOK_STALE_SEC      = 6.0   # ignore orderbook older than 6 seconds
 
 # rate-limit logs
@@ -307,6 +309,8 @@ class MarketState:
         }
         self.trades: Dict[str, deque] = {s: deque(maxlen=2000) for s in SYMBOLS_WS}
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
+        # NEW: store last accumulation burst to compute acceleration (slope)
+        self.last_burst: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     # -------- ORDERBOOK UPDATE (Bybit V5 + legacy) --------
     def update_book(self, symbol: str, data: dict):
@@ -446,7 +450,7 @@ class MarketState:
             return None
         spread = (best_ask - best_bid) / mid
 
-        # --- Burst engine: micro (0.35s) + accumulation (5s) ---
+        # --- Burst engine: micro (0.35s) + accumulation (1.5s) ---
         cutoff_micro = now - RECENT_TRADE_WINDOW
         cutoff_accum = now - ACCUM_BURST_WINDOW
 
@@ -478,6 +482,11 @@ class MarketState:
         else:
             rng = 0.0
 
+        # NEW: burst acceleration (slope)
+        prev_burst = self.last_burst.get(symbol, 0.0)
+        burst_slope = accum_burst - prev_burst
+        self.last_burst[symbol] = accum_burst
+
         return {
             "mid": mid,
             "spread": spread,
@@ -485,6 +494,7 @@ class MarketState:
             "burst": accum_burst,          # main burst used in score
             "burst_micro": micro_burst,    # confirmation burst
             "range_pct": rng,
+            "burst_slope": burst_slope,    # NEW: acceleration
         }
 
 
@@ -615,11 +625,13 @@ class ScalperBot:
         burst = feat.get("burst", 0.0)
         b_micro = feat.get("burst_micro", 0.0)
         rng = feat.get("range_pct", 0.0)
+        slope = feat.get("burst_slope", 0.0)
 
         msg = (
             f"[SKIP] {sym} {reason} {extra} | "
             f"mid={mid:.4f} spread={spread:.6f} "
-            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} rng={rng:.6f}"
+            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} "
+            f"slope={slope:.4f} rng={rng:.6f}"
         )
         print(msg, flush=True)
 
@@ -684,6 +696,7 @@ class ScalperBot:
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
+            burst_slope = feat.get("burst_slope", 0.0)
 
             # update 1m/5m buffers
             self._update_price_buffers(sym, mid, now)
@@ -711,13 +724,18 @@ class ScalperBot:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_MICRO_MIN}")
                 continue
 
+            # NEW: acceleration filter (no more entries when power is already dying)
+            if abs(burst_slope) < BURST_SLOPE_MIN:
+                self._log_skip(sym, "burst_slope", feat, f"< {BURST_SLOPE_MIN}")
+                continue
+
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
-            if imb > 0 and burst > 0 and b_micro > 0:
+            if imb > 0 and burst > 0 and b_micro > 0 and burst_slope > 0:
                 side = "buy"
-            elif imb < 0 and burst < 0 and b_micro < 0:
+            elif imb < 0 and burst < 0 and b_micro < 0 and burst_slope < 0:
                 side = "sell"
             else:
-                self._log_skip(sym, "direction", feat, "imb, burst, micro disagree")
+                self._log_skip(sym, "direction", feat, "imb/burst/micro/slope disagree")
                 continue
 
             # ---------------- IMPULSE SCORE ----------------
@@ -772,7 +790,7 @@ class ScalperBot:
     # -------------------------------------------------
     async def open_position(self, sym_ws: str, feat: dict, side: str):
         """
-        Open a new position with FIXED TP and FIXED SL.
+        Open a new position with FIXED TP and FIXED SL (watchdog-based SL).
         """
         try:
             equity = await self.exchange.fetch_equity()
@@ -797,14 +815,6 @@ class ScalperBot:
         qty = math.floor(qty * 1000) / 1000.0
         if qty <= 0:
             return
-
-        # --- Fixed TP & SL from current mid (we’ll refine using actual entry price) ---
-        if side == "buy":
-            raw_tp = mid * (1.0 + TP_PCT)
-            raw_sl = mid * (1.0 - SL_PCT)
-        else:
-            raw_tp = mid * (1.0 - TP_PCT)
-            raw_sl = mid * (1.0 + SL_PCT)
 
         # ENTRY: market order
         try:
@@ -867,7 +877,7 @@ class ScalperBot:
     async def watchdog_position(self):
         """
         - Detect if exchange closed position (TP hit or SL hit)
-        - If still open, apply backup SL check
+        - If still open, apply backup SL check (market close)
         """
         if not self.position:
             return
