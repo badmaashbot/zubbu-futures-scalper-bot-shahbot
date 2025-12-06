@@ -896,44 +896,52 @@ class ScalperBot:
         size = await self.exchange.get_position_size(sym)
         feat = self.mkt.compute_features(sym)
 
+        # ----- EXCHANGE REPORTS POSITION CLOSED -----
         if size <= 0:
-            # Position closed on exchange (TP or SL or manual)
             reason = "unknown"
             if feat:
                 mid = feat["mid"]
-                # crude classification: was this more like TP or SL?
                 if pos.side == "buy":
                     move = (mid - pos.entry_price) / pos.entry_price
                 else:
                     move = (pos.entry_price - mid) / pos.entry_price
+
                 if move > 0:
                     reason = "TP/close in profit"
                 else:
                     reason = "SL/close in loss"
+
             print(
                 f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}"
             )
             await send_telegram(
-                f"✅ Position closed on exchange: {sym} {pos.side.upper()} "
-                f"entry={pos.entry_price:.4f}"
+                f"🎯 Position closed: {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"({reason})"
             )
+
             if reason.startswith("SL"):
                 self.last_sl_time[sym] = time.time()
+
             self.position = None
             return
 
-        # If we can't compute features, we can't do backup SL
+        # We can't backup SL if we don’t have live price
         if not feat:
             return
+
         mid = feat["mid"]
         if mid <= 0:
             return
 
-        # Backup SL: if price crosses SL beyond small tolerance, close at market
+        # ---- BACKUP SL JUST IN CASE ----
         hit = False
+
+        # For long
         if pos.side == "buy" and mid <= pos.sl_price * (1.0 - 0.0005):
             hit = True
+
+        # For short
         if pos.side == "sell" and mid >= pos.sl_price * (1.0 + 0.0005):
             hit = True
 
@@ -951,6 +959,7 @@ class ScalperBot:
             self.position = None
             return
 
+   
     # -------------------------------------------------
     # idle heartbeat
     # -------------------------------------------------
