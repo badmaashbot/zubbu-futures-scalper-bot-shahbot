@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (Medium-Strict, Fixed TP/SL)
+ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py
 
-Features
---------
+Core Logic:
+-----------
 - Bybit v5 public WS (orderbook.1 + publicTrade) – linear USDT perp
 - Robust orderbook parser (new compact format + legacy)
 - Orderflow engine:
     * imbalance (top 5 levels)
-    * micro burst (last 0.40s trades)
-    * accumulation burst (last 3s trades)
+    * micro burst (last 0.35s trades)
+    * accumulation burst (last 5s trades)
     * score = |imbalance| * |accum_burst| / spread
-- Fixed TP = 0.40%, Fixed SL = 0.30%
-- 1m structure filter (support/resistance + bias)
-- 5m trend score boost (not hard filter)
-- Single open position at a time
-- No revenge trades (cooldown after SL)
-- Detailed skip logs (rate-limited)
-- Limit TP + Limit SL on exchange + watchdog backup
+- 1m structure filter (support/resistance zones)
+- 5m trend filter (up / down / flat)
+- Single open position at a time (best symbol chosen)
+- FIXED TP = +0.40%
+- FIXED SL = -0.30% (hard stop via watchdog)
+- Detailed skip logs (rate-limited) so you can see WHY it skipped
 """
 
 import os
@@ -74,30 +73,30 @@ else:
 LEVERAGE = 3
 EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notional
 
-# Fixed TP/SL (medium strict)
+# Fixed SL / TP (decimal, relative to entry)
+SL_PCT = 0.0030   # 0.30% hard stop
 TP_PCT = 0.0040   # 0.40% take profit
-SL_PCT = 0.0030   # 0.30% stop loss
 
-# --- Orderflow filters (medium strict with accumulation) ---
-SCORE_MIN        = 0.60     # impulse score threshold
-IMBALANCE_THRESH = 0.018    # 1.8% imbalance
-BURST_MICRO_MIN  = 0.015    # micro burst (0.40s) minimum
-BURST_ACCUM_MIN  = 0.045    # accumulation burst (3s) minimum
-MAX_SPREAD       = 0.0015   # 0.15% max spread
-MIN_RANGE_PCT    = 0.00010  # 0.010% minimum micro range
+# --- Orderflow filters (balanced-aggressive, with accumulation) ---
+SCORE_MIN        = 0.55    # impulse score threshold
+IMBALANCE_THRESH = 0.020   # 2% imbalance
+BURST_MICRO_MIN  = 0.010   # micro burst (0.35s) minimum
+BURST_ACCUM_MIN  = 0.030   # accumulation burst (5s) minimum
+MAX_SPREAD       = 0.0012  # 0.12% max spread
+MIN_RANGE_PCT    = 0.00012 # 0.012% minimum micro-range
 
 # Market data timing
-RECENT_TRADE_WINDOW_MICRO = 0.40   # 400 ms micro burst window
-ACCUM_BURST_WINDOW        = 3.0    # 3 second accumulation window
-BOOK_STALE_SEC            = 6.0    # ignore orderbook older than 6 seconds
+RECENT_TRADE_WINDOW = 0.35  # 350 ms micro burst window
+ACCUM_BURST_WINDOW  = 5.0   # 5 second accumulation window
+BOOK_STALE_SEC      = 6.0   # ignore orderbook older than 6 seconds
 
-# Log rate limit
-SKIP_LOG_COOLDOWN = 4.0  # seconds per (symbol, reason)
+# rate-limit logs
+LAST_SKIP_LOG: Dict[str, float] = {}
+SKIP_LOG_COOLDOWN = 5.0  # seconds per (symbol,reason)
 
 # Risk & heartbeat
-KILL_SWITCH_DD      = 0.05      # 5% equity drawdown -> stop trading
-HEARTBEAT_IDLE_SEC  = 1800      # 30 minutes idle heartbeat
-POST_SL_COOLDOWN_SEC = 30.0     # cooldown per symbol after SL to avoid revenge trades
+KILL_SWITCH_DD      = 0.05   # 5% equity drawdown -> stop trading
+HEARTBEAT_IDLE_SEC  = 1800   # 30 minutes idle heartbeat
 
 MIN_QTY_MAP = {
     "BTCUSDT": 0.001,
@@ -202,60 +201,6 @@ class ExchangeClient:
 
         return await asyncio.to_thread(_work)
 
-    async def get_position_size(self, sym_ws: str) -> float:
-        """Return contracts size for given symbol (0 if flat)."""
-        symbol = SYMBOL_MAP[sym_ws]
-
-        def _work():
-            try:
-                positions = self.client.fetch_positions([symbol])
-            except Exception:
-                return 0.0
-            size = 0.0
-            for p in positions:
-                size += safe_float(p.get("contracts"), 0.0) or 0.0
-            return size
-
-        return await asyncio.to_thread(_work)
-
-    async def create_market_order(
-        self, sym_ws: str, side: str, qty: float, reduce_only: bool = False
-    ):
-        symbol = SYMBOL_MAP[sym_ws]
-        side = side.lower()
-        params = {"category": "linear"}
-        if reduce_only:
-            params["reduceOnly"] = True
-
-        def _work():
-            return self.client.create_order(symbol, "market", side, qty, None, params)
-
-        return await asyncio.to_thread(_work)
-
-    async def create_limit_order(
-        self,
-        sym_ws: str,
-        side: str,
-        qty: float,
-        price: float,
-        reduce_only: bool = False,
-        post_only: bool = False,
-        tif: str = "GTC",
-    ):
-        symbol = SYMBOL_MAP[sym_ws]
-        side = side.lower()
-        params = {"category": "linear", "timeInForce": tif}
-        if reduce_only:
-            params["reduceOnly"] = True
-        if post_only:
-            # Bybit via ccxt often uses "PostOnly" as timeInForce; keeping as before
-            params["timeInForce"] = "PostOnly"
-
-        def _work():
-            return self.client.create_order(symbol, "limit", side, qty, price, params)
-
-        return await asyncio.to_thread(_work)
-
     async def close_position_market(self, sym_ws: str):
         """Close any open position in given symbol at market."""
         symbol = SYMBOL_MAP[sym_ws]
@@ -279,6 +224,42 @@ class ExchangeClient:
                     pass
 
         await asyncio.to_thread(_work)
+
+    async def create_market_order(
+        self, sym_ws: str, side: str, qty: float, reduce_only: bool = False
+    ):
+        symbol = SYMBOL_MAP[sym_ws]
+        side = side.lower()
+        params = {"category": "linear"}
+        if reduce_only:
+            params["reduceOnly"] = True
+
+        def _work():
+            return self.client.create_order(symbol, "market", side, qty, None, params)
+
+        return await asyncio.to_thread(_work)
+
+    async def create_limit_order(
+        self,
+        sym_ws: str,
+        side: str,
+        qty: float,
+        price: float,
+        reduce_only: bool = False,
+        post_only: bool = False,
+    ):
+        symbol = SYMBOL_MAP[sym_ws]
+        side = side.lower()
+        params = {"category": "linear", "timeInForce": "GTC"}
+        if reduce_only:
+            params["reduceOnly"] = True
+        if post_only:
+            params["timeInForce"] = "PostOnly"
+
+        def _work():
+            return self.client.create_order(symbol, "limit", side, qty, price, params)
+
+        return await asyncio.to_thread(_work)
 
 
 # --------------- DATA STRUCTURES -----------------
@@ -445,8 +426,8 @@ class MarketState:
             return None
         spread = (best_ask - best_bid) / mid
 
-        # --- Burst engine: micro (0.40s) + accumulation (3s) ---
-        cutoff_micro = now - RECENT_TRADE_WINDOW_MICRO
+        # --- Burst engine: micro (0.35s) + accumulation (5s) ---
+        cutoff_micro = now - RECENT_TRADE_WINDOW
         cutoff_accum = now - ACCUM_BURST_WINDOW
 
         micro_burst = 0.0
@@ -481,24 +462,24 @@ class MarketState:
             "mid": mid,
             "spread": spread,
             "imbalance": imbalance,
-            "burst_micro": micro_burst,
-            "burst_accum": accum_burst,
+            "burst": accum_burst,          # main burst used in score
+            "burst_micro": micro_burst,    # confirmation burst
             "range_pct": rng,
         }
 
 
 # =====================================================
-# MOMENTUM HELPERS
+# MOMENTUM (for logging / score filter)
 # =====================================================
 
-def compute_momentum_score(imbalance: float, burst_accum: float, spread: float) -> float:
+def compute_momentum_score(imbalance: float, burst: float, spread: float) -> float:
     """
     Simple impulse strength score.
     Higher = stronger push in one direction.
     """
     if spread <= 0:
         spread = 1e-6
-    return abs(imbalance) * abs(burst_accum) / spread
+    return abs(imbalance) * abs(burst) / spread
 
 
 # --------------- CORE BOT LOGIC -----------------
@@ -518,11 +499,8 @@ class ScalperBot:
         self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
         self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
 
-        # skip-log cooldown (shared)
-        self.last_skip_log: Dict[str, float] = {}
-
-        # SL cooldown (no revenge trades)
-        self.last_sl_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
+        # skip-log cooldown (local reference)
+        self.last_skip_log = LAST_SKIP_LOG
 
     # -------------------------------------------------
     # helpers: structure + trend + logging
@@ -548,7 +526,7 @@ class ScalperBot:
         Returns 1m micro structure for symbol:
           - high, low, range
           - position of current price inside that range (0..1)
-          - near_support / near_resistance / mid-zone flags
+          - near_support / near_resistance flags
         """
         buf = self.price_1m[sym]
         if len(buf) < 5:
@@ -571,7 +549,6 @@ class ScalperBot:
             "pos": pos_in_range,
             "near_support": pos_in_range <= 0.2,
             "near_resistance": pos_in_range >= 0.8,
-            "mid_zone": 0.35 <= pos_in_range <= 0.65,
         }
         return ctx
 
@@ -615,15 +592,14 @@ class ScalperBot:
         mid = feat.get("mid", 0.0)
         spread = feat.get("spread", 0.0)
         imb = feat.get("imbalance", 0.0)
+        burst = feat.get("burst", 0.0)
         b_micro = feat.get("burst_micro", 0.0)
-        b_accum = feat.get("burst_accum", 0.0)
         rng = feat.get("range_pct", 0.0)
 
         msg = (
             f"[SKIP] {sym} {reason} {extra} | "
             f"mid={mid:.4f} spread={spread:.6f} "
-            f"imb={imb:.4f} b_micro={b_micro:.4f} "
-            f"b_accum={b_accum:.4f} rng={rng:.6f}"
+            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} rng={rng:.6f}"
         )
         print(msg, flush=True)
 
@@ -678,17 +654,13 @@ class ScalperBot:
         now = time.time()
 
         for sym in SYMBOLS_WS:
-            # per-symbol cooldown after SL to avoid revenge trades
-            if now - self.last_sl_time.get(sym, 0.0) < POST_SL_COOLDOWN_SEC:
-                continue
-
             feat = self.mkt.compute_features(sym)
             if not feat:
                 continue
 
             imb = feat["imbalance"]
-            b_micro = feat["burst_micro"]
-            b_accum = feat["burst_accum"]
+            burst = feat["burst"]          # accumulation burst
+            b_micro = feat["burst_micro"]  # micro burst
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
@@ -705,10 +677,14 @@ class ScalperBot:
             if rng < MIN_RANGE_PCT:
                 self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})")
                 continue
+
+            # imbalance strength
             if abs(imb) < IMBALANCE_THRESH:
                 self._log_skip(sym, "imbalance", feat, f"< {IMBALANCE_THRESH}")
                 continue
-            if abs(b_accum) < BURST_ACCUM_MIN:
+
+            # burst confirmation: accumulation + micro
+            if abs(burst) < BURST_ACCUM_MIN:
                 self._log_skip(sym, "burst_accum", feat, f"< {BURST_ACCUM_MIN}")
                 continue
             if abs(b_micro) < BURST_MICRO_MIN:
@@ -716,51 +692,46 @@ class ScalperBot:
                 continue
 
             # ---------------- DIRECTION FROM ORDERFLOW ----------------
-            if imb > 0 and b_micro > 0 and b_accum > 0:
+            if imb > 0 and burst > 0 and b_micro > 0:
                 side = "buy"
-            elif imb < 0 and b_micro < 0 and b_accum < 0:
+            elif imb < 0 and burst < 0 and b_micro < 0:
                 side = "sell"
             else:
-                self._log_skip(sym, "direction", feat, "imb, micro, accum disagree")
+                self._log_skip(sym, "direction", feat, "imb, burst, micro disagree")
                 continue
 
-            # ---------------- STRUCTURE FILTER (1m S/R bias) ----------------
+            # ---------------- IMPULSE SCORE ----------------
+            score = compute_momentum_score(imb, burst, spread)
+            if score < SCORE_MIN:
+                self._log_skip(sym, "score", feat, f"{score:.3f} < {SCORE_MIN}")
+                continue
+
+            # ---------------- STRUCTURE FILTER (1m S/R) ----------------
             if ctx_1m:
-                pos_in_range = ctx_1m["pos"]
-                if 0.35 <= pos_in_range <= 0.65:
-                    # dead middle of 1m range – skip
-                    self._log_skip(sym, "structure", feat, "1m mid-zone")
-                    continue
                 if side == "buy" and ctx_1m["near_resistance"]:
-                    # long into resistance (avoid)
                     self._log_skip(sym, "structure", feat, "long at 1m resistance")
                     continue
                 if side == "sell" and ctx_1m["near_support"]:
                     self._log_skip(sym, "structure", feat, "short at 1m support")
                     continue
 
-            # ---------------- IMPULSE SCORE + TREND BOOST ----------------
-            score = compute_momentum_score(imb, b_accum, spread)
-            eff_score = score
-
+            # ---------------- TREND FILTER (5m bias) ----------------
             if ctx_5m:
                 trend = ctx_5m["trend"]
-                if trend == "up" and side == "buy":
-                    eff_score *= 1.3
-                elif trend == "down" and side == "sell":
-                    eff_score *= 1.3
-                elif trend == "up" and side == "sell":
-                    eff_score *= 0.7
-                elif trend == "down" and side == "buy":
-                    eff_score *= 0.7
+                if trend == "up" and side == "sell":
+                    # allow only very strong counter-trend shorts
+                    if score < SCORE_MIN * 1.8:
+                        self._log_skip(sym, "trend", feat, "uptrend, short too weak")
+                        continue
+                if trend == "down" and side == "buy":
+                    # allow only very strong counter-trend longs
+                    if score < SCORE_MIN * 1.8:
+                        self._log_skip(sym, "trend", feat, "downtrend, long too weak")
+                        continue
 
-            if eff_score < SCORE_MIN:
-                self._log_skip(sym, "score", feat, f"{eff_score:.3f} < {SCORE_MIN}")
-                continue
-
-            # choose best symbol by effective score
-            if eff_score > best_score:
-                best_score = eff_score
+            # choose best symbol by score
+            if score > best_score:
+                best_score = score
                 best_sym = sym
                 best_feat = feat
                 best_side = side
@@ -781,7 +752,7 @@ class ScalperBot:
     # -------------------------------------------------
     async def open_position(self, sym_ws: str, feat: dict, side: str):
         """
-        Open a new position with fixed TP/SL.
+        Open a new position with FIXED TP and FIXED SL.
         """
         try:
             equity = await self.exchange.fetch_equity()
@@ -807,7 +778,15 @@ class ScalperBot:
         if qty <= 0:
             return
 
-        # ENTRY: market order (fast)
+        # --- Fixed TP & SL from current mid (we’ll refine using actual entry price) ---
+        if side == "buy":
+            raw_tp = mid * (1.0 + TP_PCT)
+            raw_sl = mid * (1.0 - SL_PCT)
+        else:
+            raw_tp = mid * (1.0 - TP_PCT)
+            raw_sl = mid * (1.0 + SL_PCT)
+
+        # ENTRY: market order
         try:
             order = await self.exchange.create_market_order(
                 sym_ws, side, qty, reduce_only=False
@@ -820,7 +799,7 @@ class ScalperBot:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
-        # compute TP / SL from actual entry
+        # recompute TP / SL from actual entry
         if side == "buy":
             tp_price = entry_price * (1.0 + TP_PCT)
             sl_price = entry_price * (1.0 - SL_PCT)
@@ -828,7 +807,7 @@ class ScalperBot:
             tp_price = entry_price * (1.0 - TP_PCT)
             sl_price = entry_price * (1.0 + SL_PCT)
 
-        # place TP as reduce-only limit
+        # TP as limit reduce-only maker
         opp_side = "sell" if side == "buy" else "buy"
         try:
             await self.exchange.create_limit_order(
@@ -837,27 +816,11 @@ class ScalperBot:
                 qty,
                 tp_price,
                 reduce_only=True,
-                post_only=False,
-                tif="GTC",
+                post_only=True,
             )
         except Exception as e:
             print(f"[TP ERROR] {sym_ws}: {e}")
             await send_telegram(f"⚠️ TP order placement failed for {sym_ws}")
-
-        # place SL as reduce-only limit
-        try:
-            await self.exchange.create_limit_order(
-                sym_ws,
-                opp_side,
-                qty,
-                sl_price,
-                reduce_only=True,
-                post_only=False,
-                tif="GTC",
-            )
-        except Exception as e:
-            print(f"[SL ERROR] {sym_ws}: {e}")
-            await send_telegram(f"⚠️ SL order placement failed for {sym_ws}")
 
         self.position = Position(
             symbol_ws=sym_ws,
@@ -871,95 +834,52 @@ class ScalperBot:
         self.last_trade_time = time.time()
         print(
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} (+{TP_PCT*100:.2f}%) SL≈{sl_price:.4f} (-{SL_PCT*100:.2f}%)"
+            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
         await send_telegram(
             f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} (+{TP_PCT*100:.2f}%) SL≈{sl_price:.4f} (-{SL_PCT*100:.2f}%)"
+            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
         )
 
     # -------------------------------------------------
-    # risk watchdog: detect TP/SL hits + backup SL
+    # risk watchdog (hard SL only)
     # -------------------------------------------------
     async def watchdog_position(self):
         """
-        - Detect if TP or SL hit on exchange (position size = 0)
-        - Backup SL with market close if price crosses SL and still in position
+        Client-side SL:
+        - If price crosses fixed SL price -> close position at market.
         """
         if not self.position:
             return
-
-        pos = self.position
-        sym = pos.symbol_ws
-
-        # Check if position still open on exchange
-        size = await self.exchange.get_position_size(sym)
+        sym = self.position.symbol_ws
         feat = self.mkt.compute_features(sym)
-
-        # ----- EXCHANGE REPORTS POSITION CLOSED -----
-        if size <= 0:
-            reason = "unknown"
-            if feat:
-                mid = feat["mid"]
-                if pos.side == "buy":
-                    move = (mid - pos.entry_price) / pos.entry_price
-                else:
-                    move = (pos.entry_price - mid) / pos.entry_price
-
-                if move > 0:
-                    reason = "TP/close in profit"
-                else:
-                    reason = "SL/close in loss"
-
-            print(
-                f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}"
-            )
-            await send_telegram(
-                f"🎯 Position closed: {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
-                f"({reason})"
-            )
-
-            if reason.startswith("SL"):
-                self.last_sl_time[sym] = time.time()
-
-            self.position = None
-            return
-
-        # We can't backup SL if we don’t have live price
         if not feat:
             return
-
         mid = feat["mid"]
         if mid <= 0:
             return
 
-        # ---- BACKUP SL JUST IN CASE ----
+        pos = self.position
+
         hit = False
-
-        # For long
-        if pos.side == "buy" and mid <= pos.sl_price * (1.0 - 0.0005):
+        if pos.side == "buy" and mid <= pos.sl_price:
             hit = True
-
-        # For short
-        if pos.side == "sell" and mid >= pos.sl_price * (1.0 + 0.0005):
+        if pos.side == "sell" and mid >= pos.sl_price:
             hit = True
 
         if hit:
             await self.exchange.close_position_market(sym)
             print(
-                f"[BACKUP SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"[SL HIT] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"SL={pos.sl_price:.4f} now={mid:.4f}"
             )
             await send_telegram(
-                f"🛑 BACKUP SL {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"🛑 SL HIT {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"SL={pos.sl_price:.4f} now={mid:.4f}"
             )
-            self.last_sl_time[sym] = time.time()
             self.position = None
             return
 
-   
     # -------------------------------------------------
     # idle heartbeat
     # -------------------------------------------------
@@ -989,6 +909,7 @@ async def ws_loop(mkt: MarketState):
     Updates MarketState in real-time.
     """
 
+    # Correct topics
     topics = []
     for s in SYMBOLS_WS:
         topics.append(f"orderbook.1.{s}")
