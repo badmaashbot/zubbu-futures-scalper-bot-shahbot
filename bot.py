@@ -842,41 +842,83 @@ class ScalperBot:
         )
 
     # -------------------------------------------------
-    # risk watchdog (hard SL only)
+    # risk watchdog: detect TP/SL hits + backup SL
     # -------------------------------------------------
     async def watchdog_position(self):
         """
-        Client-side SL:
-        - If price crosses fixed SL price -> close position at market.
+        - Detect if TP or SL hit on exchange (position size = 0)
+        - Backup SL with market close if price crosses SL and still in position
         """
         if not self.position:
             return
-        sym = self.position.symbol_ws
+
+        pos = self.position
+        sym = pos.symbol_ws
+
+        # Check if position still open on exchange
+        size = await self.exchange.get_position_size(sym)
         feat = self.mkt.compute_features(sym)
+
+        # ----- EXCHANGE REPORTS POSITION CLOSED -----
+        if size <= 0:
+            reason = "unknown"
+            if feat:
+                mid = feat["mid"]
+                if pos.side == "buy":
+                    move = (mid - pos.entry_price) / pos.entry_price
+                else:
+                    move = (pos.entry_price - mid) / pos.entry_price
+
+                if move > 0:
+                    reason = "TP/close in profit"
+                else:
+                    reason = "SL/close in loss"
+
+            print(
+                f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}"
+            )
+            await send_telegram(
+                f"🎯 Position closed: {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"({reason})"
+            )
+
+            if reason.startswith("SL"):
+                self.last_sl_time[sym] = time.time()
+
+            self.position = None
+            return
+
+        # We can't backup SL if we don’t have live price
         if not feat:
             return
+
         mid = feat["mid"]
         if mid <= 0:
             return
 
-        pos = self.position
-
+        # ---- BACKUP SL JUST IN CASE ----
         hit = False
-        if pos.side == "buy" and mid <= pos.sl_price:
+
+        # For long
+        if pos.side == "buy" and mid <= pos.sl_price * (1.0 - 0.0005):
             hit = True
-        if pos.side == "sell" and mid >= pos.sl_price:
+
+        # For short
+        if pos.side == "sell" and mid >= pos.sl_price * (1.0 + 0.0005):
             hit = True
 
         if hit:
             await self.exchange.close_position_market(sym)
             print(
-                f"[SL HIT] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"[BACKUP SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"SL={pos.sl_price:.4f} now={mid:.4f}"
             )
             await send_telegram(
-                f"🛑 SL HIT {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"🛑 BACKUP SL {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
                 f"SL={pos.sl_price:.4f} now={mid:.4f}"
             )
+            self.last_sl_time[sym] = time.time()
             self.position = None
             return
 
