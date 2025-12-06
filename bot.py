@@ -79,7 +79,7 @@ TP_PCT = 0.0040   # 0.40% take profit
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
 SCORE_MIN        = 0.90    # impulse score threshold
-IMBALANCE_THRESH = 0.06   # 2% imbalance
+IMBALANCE_THRESH = 0.06   # 6% imbalance
 BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
 BURST_ACCUM_MIN  = 0.060   # accumulation burst (5s) minimum
 MAX_SPREAD       = 0.0012  # 0.12% max spread
