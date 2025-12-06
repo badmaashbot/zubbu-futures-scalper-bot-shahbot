@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (Mode B entry + burst_slope)
+ZUBBU_SCALPER_V4.4_VELOCITY_GUARD – Full bot.py
 
 Core Logic:
 -----------
@@ -9,9 +9,12 @@ Core Logic:
 - Orderflow engine:
     * imbalance (top 5 levels)
     * micro burst (last 0.35s trades)
-    * accumulation burst (last 1.5s trades)  <-- tightened
-    * burst_slope (acceleration of accum burst)  <-- NEW
+    * accumulation burst (last 1.5s trades)
+    * burst_slope (acceleration of accum burst)
     * score = |imbalance| * |accum_burst| / spread
+- Velocity confirmation (enough trades in window)
+- Continuation filter (short-term price direction)
+- BTC volatility guard (pause entries during BTC shock)
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
 - Single open position at a time (best symbol chosen)
@@ -34,7 +37,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP_MODEB"
+BOT_VERSION = "ZUBBU_SCALPER_V4.4_VELOCITY_GUARD"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -83,13 +86,18 @@ SCORE_MIN        = 0.90    # impulse score threshold
 IMBALANCE_THRESH = 0.06    # 6% imbalance
 BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
 BURST_ACCUM_MIN  = 0.060   # accumulation burst minimum
-BURST_SLOPE_MIN  = 0.020   # NEW: minimum acceleration for Mode B
+
+# NEW: acceleration + velocity + BTC guard
+BURST_SLOPE_MIN    = 0.020   # minimum burst acceleration
+VEL_MIN_TRADES     = 8       # minimum trades in accumulation window
+BTC_VOL_GUARD_PCT  = 0.004   # 0.4% BTC 1m move triggers guard
+
 MAX_SPREAD       = 0.0012  # 0.12% max spread
 MIN_RANGE_PCT    = 0.00020 # 0.012% minimum micro-range
 
 # Market data timing
 RECENT_TRADE_WINDOW = 0.35  # 350 ms micro burst window
-ACCUM_BURST_WINDOW  = 1.5   # NEW: 1.5s accumulation (faster entries)
+ACCUM_BURST_WINDOW  = 1.5   # 1.5 second accumulation window (faster entries)
 BOOK_STALE_SEC      = 6.0   # ignore orderbook older than 6 seconds
 
 # rate-limit logs
@@ -423,7 +431,8 @@ class MarketState:
 
     def compute_features(self, symbol: str) -> Optional[dict]:
         """
-        Compute mid, spread, imbalance, micro burst, accumulation burst, micro-range.
+        Compute mid, spread, imbalance, micro burst, accumulation burst,
+        burst_slope, trade_count, trade_velocity, micro-range.
         Returns None if book/trades are not usable.
         """
         book = self.books[symbol]
@@ -457,6 +466,7 @@ class MarketState:
         micro_burst = 0.0
         accum_burst = 0.0
         recent_prices: List[float] = []
+        trade_count = 0  # NEW: for velocity
 
         for t in reversed(self.trades[symbol]):
             ts = t["ts"]
@@ -470,6 +480,7 @@ class MarketState:
                 micro_burst += side_mult * sz
 
             recent_prices.append(t["price"])
+            trade_count += 1
 
         if not recent_prices:
             return None
@@ -487,6 +498,10 @@ class MarketState:
         burst_slope = accum_burst - prev_burst
         self.last_burst[symbol] = accum_burst
 
+        # NEW: trade velocity
+        window = max(ACCUM_BURST_WINDOW, 0.001)
+        trade_velocity = trade_count / window
+
         return {
             "mid": mid,
             "spread": spread,
@@ -494,7 +509,9 @@ class MarketState:
             "burst": accum_burst,          # main burst used in score
             "burst_micro": micro_burst,    # confirmation burst
             "range_pct": rng,
-            "burst_slope": burst_slope,    # NEW: acceleration
+            "burst_slope": burst_slope,    # acceleration
+            "trade_count": trade_count,    # raw trades in window
+            "trade_velocity": trade_velocity,  # trades/sec
         }
 
 
@@ -531,6 +548,9 @@ class ScalperBot:
 
         # skip-log cooldown (local reference)
         self.last_skip_log = LAST_SKIP_LOG
+
+        # BTC volatility guard last log
+        self.last_btc_guard_ts: float = 0.0
 
     # -------------------------------------------------
     # helpers: structure + trend + logging
@@ -626,12 +646,14 @@ class ScalperBot:
         b_micro = feat.get("burst_micro", 0.0)
         rng = feat.get("range_pct", 0.0)
         slope = feat.get("burst_slope", 0.0)
+        tcount = feat.get("trade_count", 0)
+        tvel = feat.get("trade_velocity", 0.0)
 
         msg = (
             f"[SKIP] {sym} {reason} {extra} | "
             f"mid={mid:.4f} spread={spread:.6f} "
             f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} "
-            f"slope={slope:.4f} rng={rng:.6f}"
+            f"slope={slope:.4f} trades={tcount} vel={tvel:.2f} rng={rng:.6f}"
         )
         print(msg, flush=True)
 
@@ -685,6 +707,24 @@ class ScalperBot:
         best_side: Optional[str] = None
         now = time.time()
 
+        # ---------- BTC Volatility Guard ----------
+        btc_buf = self.price_1m.get("BTCUSDT")
+        if btc_buf and len(btc_buf) >= 2:
+            p_first = btc_buf[0][1]
+            p_last = btc_buf[-1][1]
+            if p_first > 0:
+                btc_change = abs(p_last - p_first) / p_first
+                if btc_change > BTC_VOL_GUARD_PCT:
+                    if now - self.last_btc_guard_ts > 10.0:
+                        self.last_btc_guard_ts = now
+                        print(
+                            f"[GUARD] BTC 1m move={btc_change:.4f} > "
+                            f"{BTC_VOL_GUARD_PCT:.4f} -> skip entries",
+                            flush=True
+                        )
+                    await self.maybe_heartbeat()
+                    return
+
         for sym in SYMBOLS_WS:
             feat = self.mkt.compute_features(sym)
             if not feat:
@@ -697,6 +737,8 @@ class ScalperBot:
             rng = feat["range_pct"]
             mid = feat["mid"]
             burst_slope = feat.get("burst_slope", 0.0)
+            trade_count = feat.get("trade_count", 0)
+            trade_velocity = feat.get("trade_velocity", 0.0)  # currently just for logs
 
             # update 1m/5m buffers
             self._update_price_buffers(sym, mid, now)
@@ -724,7 +766,17 @@ class ScalperBot:
                 self._log_skip(sym, "burst_micro", feat, f"< {BURST_MICRO_MIN}")
                 continue
 
-            # NEW: acceleration filter (no more entries when power is already dying)
+            # ---------- Velocity confirmation ----------
+            if trade_count < VEL_MIN_TRADES:
+                self._log_skip(
+                    sym,
+                    "velocity",
+                    feat,
+                    f"trades={trade_count} < {VEL_MIN_TRADES}"
+                )
+                continue
+
+            # NEW: acceleration filter
             if abs(burst_slope) < BURST_SLOPE_MIN:
                 self._log_skip(sym, "burst_slope", feat, f"< {BURST_SLOPE_MIN}")
                 continue
@@ -737,6 +789,20 @@ class ScalperBot:
             else:
                 self._log_skip(sym, "direction", feat, "imb/burst/micro/slope disagree")
                 continue
+
+            # ---------- Continuation filter (short-term price move) ----------
+            buf1 = self.price_1m[sym]
+            if len(buf1) >= 3:
+                p_old = buf1[-3][1]
+                p_new = buf1[-1][1]
+                if p_old > 0:
+                    price_chg = (p_new - p_old) / p_old
+                    if side == "buy" and price_chg <= 0:
+                        self._log_skip(sym, "continuation", feat, "price not moving up")
+                        continue
+                    if side == "sell" and price_chg >= 0:
+                        self._log_skip(sym, "continuation", feat, "price not moving down")
+                        continue
 
             # ---------------- IMPULSE SCORE ----------------
             score = compute_momentum_score(imb, burst, spread)
@@ -877,7 +943,7 @@ class ScalperBot:
     async def watchdog_position(self):
         """
         - Detect if exchange closed position (TP hit or SL hit)
-        - If still open, apply backup SL check (market close)
+        - If still open, apply backup SL check
         """
         if not self.position:
             return
