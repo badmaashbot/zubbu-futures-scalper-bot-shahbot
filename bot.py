@@ -531,7 +531,6 @@ def compute_momentum_score(imbalance: float, burst: float, spread: float) -> flo
 
 # --------------- CORE BOT LOGIC -----------------
 
-
 class ScalperBot:
     def __init__(self, exchange: ExchangeClient, mkt: MarketState):
         self.exchange = exchange
@@ -546,25 +545,24 @@ class ScalperBot:
         self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
         self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
 
-        # skip-log cooldown (local reference)
+        # skip-log cooldown
         self.last_skip_log = LAST_SKIP_LOG
 
-        # BTC volatility guard last log
+        # BTC Guard
         self.last_btc_guard_ts: float = 0.0
 
     # -------------------------------------------------
-    # helpers: structure + trend + logging
+    # structure helpers
     # -------------------------------------------------
-    def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
-        """Keep 1m + 5m rolling mid-price history."""
+    def _update_price_buffers(self, sym: str, mid: float, now: float):
         buf1 = self.price_1m[sym]
         buf5 = self.price_5m[sym]
 
         buf1.append((now, mid))
         buf5.append((now, mid))
 
-        cutoff1 = now - 60.0       # 1 minute
-        cutoff5 = now - 300.0      # 5 minutes
+        cutoff1 = now - 60
+        cutoff5 = now - 300
 
         while buf1 and buf1[0][0] < cutoff1:
             buf1.popleft()
@@ -572,285 +570,209 @@ class ScalperBot:
             buf5.popleft()
 
     def _get_1m_context(self, sym: str) -> Optional[dict]:
-        """
-        Returns 1m micro structure for symbol:
-          - high, low, range
-          - position of current price inside that range (0..1)
-          - near_support / near_resistance flags
-        """
         buf = self.price_1m[sym]
         if len(buf) < 5:
             return None
-
         prices = [p for _, p in buf]
         high = max(prices)
         low = min(prices)
         rng = high - low
         if rng <= 0:
             return None
-
-        last_price = prices[-1]
-        pos_in_range = (last_price - low) / rng  # 0 bottom, 1 top
-
-        ctx = {
+        last = prices[-1]
+        pos = (last - low) / rng
+        return {
             "high": high,
             "low": low,
             "range": rng,
-            "pos": pos_in_range,
-            "near_support": pos_in_range <= 0.2,
-            "near_resistance": pos_in_range >= 0.8,
+            "pos": pos,
+            "near_support": pos <= 0.2,
+            "near_resistance": pos >= 0.8,
         }
-        return ctx
 
     def _get_5m_trend(self, sym: str) -> Optional[dict]:
-        """
-        Returns 5m trend context:
-          - trend: "up", "down", "flat"
-        """
         buf = self.price_5m[sym]
         if len(buf) < 10:
             return None
-
         prices = [p for _, p in buf]
         first = prices[0]
         last = prices[-1]
         if first <= 0:
             return None
-
-        change = (last - first) / first
-
-        if change > 0.002:      # +0.2% or more = uptrend
+        chg = (last - first) / first
+        if chg > 0.002:
             trend = "up"
-        elif change < -0.002:   # -0.2% or more = downtrend
+        elif chg < -0.002:
             trend = "down"
         else:
             trend = "flat"
-
-        return {"trend": trend, "change": change}
-
-    def _log_skip(self, sym: str, reason: str, feat: dict, extra: str = "") -> None:
-        """
-        Rate-limited skip logger so you see WHY the bot is not trading.
-        """
-        now = time.time()
-        key = f"{sym}:{reason}"
-        last = self.last_skip_log.get(key, 0.0)
-        if now - last < SKIP_LOG_COOLDOWN:
-            return  # only log same reason every few seconds per symbol
-
-        self.last_skip_log[key] = now
-        mid = feat.get("mid", 0.0)
-        spread = feat.get("spread", 0.0)
-        imb = feat.get("imbalance", 0.0)
-        burst = feat.get("burst", 0.0)
-        b_micro = feat.get("burst_micro", 0.0)
-        rng = feat.get("range_pct", 0.0)
-        slope = feat.get("burst_slope", 0.0)
-        tcount = feat.get("trade_count", 0)
-        tvel = feat.get("trade_velocity", 0.0)
-
-        msg = (
-            f"[SKIP] {sym} {reason} {extra} | "
-            f"mid={mid:.4f} spread={spread:.6f} "
-            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} "
-            f"slope={slope:.4f} trades={tcount} vel={tvel:.2f} rng={rng:.6f}"
-        )
-        print(msg, flush=True)
+        return {"trend": trend, "change": chg}
 
     # -------------------------------------------------
-    # lifecycle
+    # skip logger
+    # -------------------------------------------------
+    def _log_skip(self, sym, reason, feat, extra=""):
+        now = time.time()
+        key = f"{sym}:{reason}"
+        if now - self.last_skip_log.get(key, 0) < SKIP_LOG_COOLDOWN:
+            return
+        self.last_skip_log[key] = now
+        print(f"[SKIP] {sym} {reason} {extra}", flush=True)
+
+    # -------------------------------------------------
+    # INIT + Kill
     # -------------------------------------------------
     async def init_equity_and_leverage(self):
         eq = await self.exchange.fetch_equity()
         self.start_equity = eq
-        print(f"[INIT] Equity: {eq:.2f} USDT — {BOT_VERSION}")
-        await send_telegram(
-            f"🟢 Bot started ({BOT_VERSION}). Equity: {eq:.2f} USDT. "
-            f"Kill at {KILL_SWITCH_DD*100:.1f}% DD."
-        )
-        # set leverage for all symbols
+        print(f"[INIT] Equity {eq:.2f}")
+
         for s in SYMBOLS_WS:
             await self.exchange.set_leverage(s, LEVERAGE)
-        print("[INIT] Leverage set for all symbols.")
-        await send_telegram("⚙️ Leverage set for all symbols.")
 
     async def maybe_kill_switch(self):
         if self.start_equity is None:
             return
         eq = await self.exchange.fetch_equity()
-        if self.start_equity <= 0:
-            return
         dd = (self.start_equity - eq) / self.start_equity
         if dd >= KILL_SWITCH_DD:
             if self.position:
                 await self.exchange.close_position_market(self.position.symbol_ws)
-                await send_telegram(
-                    f"🚨 Kill-switch: equity drawdown {dd*100:.2f}%. Position closed."
-                )
-                self.position = None
-            raise SystemExit("Kill-switch triggered")
+            raise SystemExit("Kill switch")
 
     # -------------------------------------------------
-    # main decision loop
+    # MAIN DECISION LOOP
     # -------------------------------------------------
     async def eval_symbols_and_maybe_enter(self):
-        """
-        Scan all symbols, compute features, pick the best one and open position.
-        Only runs when there is NO open position.
-        """
-        if self.position is not None:
+        if self.position:
             return
 
-        best_score = 0.0
-        best_sym: Optional[str] = None
-        best_feat: Optional[dict] = None
-        best_side: Optional[str] = None
+        best_score = 0
+        best_sym = None
+        best_feat = None
+        best_side = None
         now = time.time()
 
-        # ---------- BTC Volatility Guard ----------
+        # ---------------- BTC VOLATILITY GUARD ----------------
         btc_buf = self.price_1m.get("BTCUSDT")
         if btc_buf and len(btc_buf) >= 2:
-            p_first = btc_buf[0][1]
-            p_last = btc_buf[-1][1]
-            if p_first > 0:
-                btc_change = abs(p_last - p_first) / p_first
-                if btc_change > BTC_VOL_GUARD_PCT:
-                    if now - self.last_btc_guard_ts > 10.0:
-                        self.last_btc_guard_ts = now
-                        print(
-                            f"[GUARD] BTC 1m move={btc_change:.4f} > "
-                            f"{BTC_VOL_GUARD_PCT:.4f} -> skip entries",
-                            flush=True
-                        )
-                    await self.maybe_heartbeat()
+            p1 = btc_buf[0][1]
+            p2 = btc_buf[-1][1]
+            if p1 > 0:
+                btc_move = abs(p2 - p1) / p1
+                if btc_move > BTC_VOL_GUARD_PCT:
+                    self.last_btc_guard_ts = now
                     return
 
+        # ======================================================
+        #                SCAN ALL SYMBOLS
+        # ======================================================
         for sym in SYMBOLS_WS:
             feat = self.mkt.compute_features(sym)
             if not feat:
                 continue
 
             imb = feat["imbalance"]
-            burst = feat["burst"]          # accumulation burst
-            b_micro = feat["burst_micro"]  # micro burst
+            burst = feat["burst"]
+            micro = feat["burst_micro"]
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
-            burst_slope = feat.get("burst_slope", 0.0)
-            trade_count = feat.get("trade_count", 0)
-            trade_velocity = feat.get("trade_velocity", 0.0)  # currently just for logs
+            slope = feat.get("burst_slope", 0.0)
+            trades = feat.get("trade_count", 0)
 
-            # update 1m/5m buffers
+            # update structure buffers
             self._update_price_buffers(sym, mid, now)
             ctx_1m = self._get_1m_context(sym)
             ctx_5m = self._get_5m_trend(sym)
 
             # ---------------- BASIC FILTERS ----------------
-            if spread <= 0 or spread > MAX_SPREAD:
-                self._log_skip(sym, "spread", feat, f"> MAX_SPREAD({MAX_SPREAD})")
+            if spread > MAX_SPREAD:
                 continue
             if rng < MIN_RANGE_PCT:
-                self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})")
                 continue
-
-            # imbalance strength
             if abs(imb) < IMBALANCE_THRESH:
-                self._log_skip(sym, "imbalance", feat, f"< {IMBALANCE_THRESH}")
                 continue
-
-            # burst confirmation: accumulation + micro
             if abs(burst) < BURST_ACCUM_MIN:
-                self._log_skip(sym, "burst_accum", feat, f"< {BURST_ACCUM_MIN}")
                 continue
-            if abs(b_micro) < BURST_MICRO_MIN:
-                self._log_skip(sym, "burst_micro", feat, f"< {BURST_MICRO_MIN}")
+            if abs(micro) < BURST_MICRO_MIN:
                 continue
-
-            # ---------- Velocity confirmation ----------
-            if trade_count < VEL_MIN_TRADES:
-                self._log_skip(
-                    sym,
-                    "velocity",
-                    feat,
-                    f"trades={trade_count} < {VEL_MIN_TRADES}"
-                )
+            if trades < VEL_MIN_TRADES:
+                continue
+            if abs(slope) < BURST_SLOPE_MIN:
                 continue
 
-            # NEW: acceleration filter
-            if abs(burst_slope) < BURST_SLOPE_MIN:
-                self._log_skip(sym, "burst_slope", feat, f"< {BURST_SLOPE_MIN}")
-                continue
-
-            # ---------------- DIRECTION FROM ORDERFLOW ----------------
-            if imb > 0 and burst > 0 and b_micro > 0 and burst_slope > 0:
+            # -------- DIRECTION --------
+            if imb > 0 and burst > 0 and micro > 0 and slope > 0:
                 side = "buy"
-            elif imb < 0 and burst < 0 and b_micro < 0 and burst_slope < 0:
+            elif imb < 0 and burst < 0 and micro < 0 and slope < 0:
                 side = "sell"
             else:
-                self._log_skip(sym, "direction", feat, "imb/burst/micro/slope disagree")
                 continue
 
-            # ---------- Continuation filter (short-term price move) ----------
+            # ---------- Continuation check ----------
             buf1 = self.price_1m[sym]
             if len(buf1) >= 3:
-                p_old = buf1[-3][1]
-                p_new = buf1[-1][1]
-                if p_old > 0:
-                    price_chg = (p_new - p_old) / p_old
-                    if side == "buy" and price_chg <= 0:
-                        self._log_skip(sym, "continuation", feat, "price not moving up")
+                o = buf1[-3][1]
+                n = buf1[-1][1]
+                if o > 0:
+                    ch = (n - o) / o
+                    if side == "buy" and ch <= 0:
                         continue
-                    if side == "sell" and price_chg >= 0:
-                        self._log_skip(sym, "continuation", feat, "price not moving down")
+                    if side == "sell" and ch >= 0:
                         continue
 
-            # ---------------- IMPULSE SCORE ----------------
+            # ---------- SCORE ----------
             score = compute_momentum_score(imb, burst, spread)
             if score < SCORE_MIN:
-                self._log_skip(sym, "score", feat, f"{score:.3f} < {SCORE_MIN}")
                 continue
 
-            # ---------------- STRUCTURE FILTER (1m S/R) ----------------
+            # ---------- 1m STRUCTURE ----------
             if ctx_1m:
                 if side == "buy" and ctx_1m["near_resistance"]:
-                    self._log_skip(sym, "structure", feat, "long at 1m resistance")
                     continue
                 if side == "sell" and ctx_1m["near_support"]:
-                    self._log_skip(sym, "structure", feat, "short at 1m support")
                     continue
 
-            # ---------------- TREND FILTER (5m bias) ----------------
+            # ---------- 5m TREND ----------
             if ctx_5m:
-                trend = ctx_5m["trend"]
-                if trend == "up" and side == "sell":
-                    # allow only very strong counter-trend shorts
-                    if score < SCORE_MIN * 1.8:
-                        self._log_skip(sym, "trend", feat, "uptrend, short too weak")
-                        continue
-                if trend == "down" and side == "buy":
-                    # allow only very strong counter-trend longs
-                    if score < SCORE_MIN * 1.8:
-                        self._log_skip(sym, "trend", feat, "downtrend, long too weak")
-                        continue
+                tr = ctx_5m["trend"]
+                if tr == "up" and side == "sell" and score < SCORE_MIN * 1.8:
+                    continue
+                if tr == "down" and side == "buy" and score < SCORE_MIN * 1.8:
+                    continue
 
-            # choose best symbol by score
+            # ====================================================
+            # TP ROOM CHECK (PATCH)
+            # ====================================================
+            if ctx_1m:
+                if side == "buy":
+                    dist = (ctx_1m["high"] - mid) / mid
+                    if dist < (TP_PCT + 0.0002):
+                        continue
+                if side == "sell":
+                    dist = (mid - ctx_1m["low"]) / mid
+                    if dist < (TP_PCT + 0.0002):
+                        continue
+            # ====================================================
+
+            # -------- choose best by score --------
             if score > best_score:
                 best_score = score
                 best_sym = sym
                 best_feat = feat
                 best_side = side
 
-        if not best_sym or not best_feat or not best_side:
-            await self.maybe_heartbeat()
+        if not best_sym:
             return
 
-        # tiny anti-spam: don't double-trigger same symbol in <0.5s
+        # anti spam
         if now - self.mkt.last_signal_ts[best_sym] < 0.5:
             return
         self.mkt.last_signal_ts[best_sym] = now
 
         await self.open_position(best_sym, best_feat, best_side)
-
+        
     # -------------------------------------------------
     # order execution
     # -------------------------------------------------
