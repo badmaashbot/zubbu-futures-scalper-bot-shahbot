@@ -121,7 +121,7 @@ BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
 TARGET_MOVE_PCT   = 0.006  # 0.60% target room
 
 # Liquidity vacuum
-LV_MAX_WALL_RATIO = 0.50   # opposite wall max 50% of our side liqudity
+LV_MAX_WALL_RATIO = 0.40   # opposite wall max 40% of our side liqudity
 
 # --------------- TELEGRAM -----------------
 
