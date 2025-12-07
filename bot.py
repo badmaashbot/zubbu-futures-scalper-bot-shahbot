@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.4_VELOCITY_GUARD – Full bot.py
+ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (with TP room + LV filter)
 
 Core Logic:
 -----------
@@ -9,17 +9,15 @@ Core Logic:
 - Orderflow engine:
     * imbalance (top 5 levels)
     * micro burst (last 0.35s trades)
-    * accumulation burst (last 1.5s trades)
-    * burst_slope (acceleration of accum burst)
+    * accumulation burst (last 5s trades)
     * score = |imbalance| * |accum_burst| / spread
-- Velocity confirmation (enough trades in window)
-- Continuation filter (short-term price direction)
-- BTC volatility guard (pause entries during BTC shock)
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
 - Single open position at a time (best symbol chosen)
 - FIXED TP = +0.40%
 - FIXED SL = -0.30% (hard stop via watchdog)
+- TP room filter (requires ~0.60% space in 1m range)
+- Liquidity Vacuum (LV) filter: opposite wall max 50%
 - Detailed skip logs (rate-limited) so you can see WHY it skipped
 """
 
@@ -37,7 +35,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.4_VELOCITY_GUARD"
+BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -78,26 +76,20 @@ LEVERAGE = 3
 EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notional
 
 # Fixed SL / TP (decimal, relative to entry)
-SL_PCT = 0.0030   # 0.30% hard stop (watchdog)
+SL_PCT = 0.0030   # 0.30% hard stop
 TP_PCT = 0.0040   # 0.40% take profit
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
-SCORE_MIN        = 0.90    # impulse score threshold
+SCORE_MIN        = 0.90    # impulse score threshold (you can raise to 1.5 if you want tighter)
 IMBALANCE_THRESH = 0.06    # 6% imbalance
 BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
-BURST_ACCUM_MIN  = 0.060   # accumulation burst minimum
-
-# NEW: acceleration + velocity + BTC guard
-BURST_SLOPE_MIN    = 0.020   # minimum burst acceleration
-VEL_MIN_TRADES     = 8       # minimum trades in accumulation window
-BTC_VOL_GUARD_PCT  = 0.004   # 0.4% BTC 1m move triggers guard
-
+BURST_ACCUM_MIN  = 0.060   # accumulation burst (5s) minimum
 MAX_SPREAD       = 0.0012  # 0.12% max spread
 MIN_RANGE_PCT    = 0.00020 # 0.012% minimum micro-range
 
 # Market data timing
 RECENT_TRADE_WINDOW = 0.35  # 350 ms micro burst window
-ACCUM_BURST_WINDOW  = 1.5   # 1.5 second accumulation window (faster entries)
+ACCUM_BURST_WINDOW  = 5.0   # 5 second accumulation window
 BOOK_STALE_SEC      = 6.0   # ignore orderbook older than 6 seconds
 
 # rate-limit logs
@@ -115,6 +107,21 @@ MIN_QTY_MAP = {
     "SOLUSDT": 0.1,
     "DOGEUSDT": 5.0,
 }
+
+# --------------- EXTRA FILTER CONSTANTS -----------------
+
+# BTC volatility guard: if BTC 1m move > this, skip all entries
+BTC_VOL_GUARD_PCT = 0.004  # 0.40% in 1 minute
+
+# Velocity / acceleration
+VEL_MIN_TRADES   = 8       # minimum trades in last 5s
+BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
+
+# TP room expectation: we want space for ~0.60% move even though TP is 0.40%
+TARGET_MOVE_PCT   = 0.006  # 0.60% target room
+
+# Liquidity vacuum
+LV_MAX_WALL_RATIO = 0.50   # opposite wall max 50% of our side liqudity
 
 # --------------- TELEGRAM -----------------
 
@@ -317,8 +324,6 @@ class MarketState:
         }
         self.trades: Dict[str, deque] = {s: deque(maxlen=2000) for s in SYMBOLS_WS}
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
-        # NEW: store last accumulation burst to compute acceleration (slope)
-        self.last_burst: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
 
     # -------- ORDERBOOK UPDATE (Bybit V5 + legacy) --------
     def update_book(self, symbol: str, data: dict):
@@ -431,9 +436,8 @@ class MarketState:
 
     def compute_features(self, symbol: str) -> Optional[dict]:
         """
-        Compute mid, spread, imbalance, micro burst, accumulation burst,
-        burst_slope, trade_count, trade_velocity, micro-range.
-        Returns None if book/trades are not usable.
+        Compute mid, spread, imbalance, micro burst, accumulation burst, micro-range,
+        and extra info for velocity / slope filters.
         """
         book = self.books[symbol]
         if not book["bids"] or not book["asks"]:
@@ -459,14 +463,14 @@ class MarketState:
             return None
         spread = (best_ask - best_bid) / mid
 
-        # --- Burst engine: micro (0.35s) + accumulation (1.5s) ---
+        # --- Burst engine: micro (0.35s) + accumulation (5s) ---
         cutoff_micro = now - RECENT_TRADE_WINDOW
         cutoff_accum = now - ACCUM_BURST_WINDOW
 
         micro_burst = 0.0
         accum_burst = 0.0
         recent_prices: List[float] = []
-        trade_count = 0  # NEW: for velocity
+        recent_trades: List[Tuple[float, float]] = []
 
         for t in reversed(self.trades[symbol]):
             ts = t["ts"]
@@ -479,8 +483,9 @@ class MarketState:
             if ts >= cutoff_micro:
                 micro_burst += side_mult * sz
 
-            recent_prices.append(t["price"])
-            trade_count += 1
+            price = t["price"]
+            recent_prices.append(price)
+            recent_trades.append((ts, side_mult * sz))
 
         if not recent_prices:
             return None
@@ -493,14 +498,16 @@ class MarketState:
         else:
             rng = 0.0
 
-        # NEW: burst acceleration (slope)
-        prev_burst = self.last_burst.get(symbol, 0.0)
-        burst_slope = accum_burst - prev_burst
-        self.last_burst[symbol] = accum_burst
+        # velocity and simple acceleration of burst
+        trade_count = len(recent_trades)
+        trade_velocity = trade_count / ACCUM_BURST_WINDOW
 
-        # NEW: trade velocity
-        window = max(ACCUM_BURST_WINDOW, 0.001)
-        trade_velocity = trade_count / window
+        burst_slope = 0.0
+        if trade_count >= 2:
+            mid_split = now - ACCUM_BURST_WINDOW / 2.0
+            early = sum(v for ts, v in recent_trades if ts < mid_split)
+            late = sum(v for ts, v in recent_trades if ts >= mid_split)
+            burst_slope = late - early
 
         return {
             "mid": mid,
@@ -509,9 +516,9 @@ class MarketState:
             "burst": accum_burst,          # main burst used in score
             "burst_micro": micro_burst,    # confirmation burst
             "range_pct": rng,
-            "burst_slope": burst_slope,    # acceleration
-            "trade_count": trade_count,    # raw trades in window
-            "trade_velocity": trade_velocity,  # trades/sec
+            "burst_slope": burst_slope,
+            "trade_count": trade_count,
+            "trade_velocity": trade_velocity,
         }
 
 
@@ -531,6 +538,7 @@ def compute_momentum_score(imbalance: float, burst: float, spread: float) -> flo
 
 # --------------- CORE BOT LOGIC -----------------
 
+
 class ScalperBot:
     def __init__(self, exchange: ExchangeClient, mkt: MarketState):
         self.exchange = exchange
@@ -541,24 +549,29 @@ class ScalperBot:
         self.last_trade_time: float = 0.0
         self.last_heartbeat_ts: float = 0.0
 
+        # price history buffers for 1m + 5m structure
         self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
         self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
 
+        # skip-log cooldown (local reference)
         self.last_skip_log = LAST_SKIP_LOG
+
+        # BTC volatility guard last log
         self.last_btc_guard_ts: float = 0.0
 
     # -------------------------------------------------
     # helpers: structure + trend + logging
     # -------------------------------------------------
     def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
+        """Keep 1m + 5m rolling mid-price history."""
         buf1 = self.price_1m[sym]
         buf5 = self.price_5m[sym]
 
         buf1.append((now, mid))
         buf5.append((now, mid))
 
-        cutoff1 = now - 60.0
-        cutoff5 = now - 300.0
+        cutoff1 = now - 60.0       # 1 minute
+        cutoff5 = now - 300.0      # 5 minutes
 
         while buf1 and buf1[0][0] < cutoff1:
             buf1.popleft()
@@ -566,9 +579,16 @@ class ScalperBot:
             buf5.popleft()
 
     def _get_1m_context(self, sym: str) -> Optional[dict]:
+        """
+        Returns 1m micro structure for symbol:
+          - high, low, range
+          - position of current price inside that range (0..1)
+          - near_support / near_resistance flags
+        """
         buf = self.price_1m[sym]
         if len(buf) < 5:
             return None
+
         prices = [p for _, p in buf]
         high = max(prices)
         low = min(prices)
@@ -577,9 +597,9 @@ class ScalperBot:
             return None
 
         last_price = prices[-1]
-        pos_in_range = (last_price - low) / rng
+        pos_in_range = (last_price - low) / rng  # 0 bottom, 1 top
 
-        return {
+        ctx = {
             "high": high,
             "low": low,
             "range": rng,
@@ -587,21 +607,28 @@ class ScalperBot:
             "near_support": pos_in_range <= 0.2,
             "near_resistance": pos_in_range >= 0.8,
         }
+        return ctx
 
     def _get_5m_trend(self, sym: str) -> Optional[dict]:
+        """
+        Returns 5m trend context:
+          - trend: "up", "down", "flat"
+        """
         buf = self.price_5m[sym]
         if len(buf) < 10:
             return None
+
         prices = [p for _, p in buf]
         first = prices[0]
         last = prices[-1]
         if first <= 0:
             return None
+
         change = (last - first) / first
 
-        if change > 0.002:
+        if change > 0.002:      # +0.2% or more = uptrend
             trend = "up"
-        elif change < -0.002:
+        elif change < -0.002:   # -0.2% or more = downtrend
             trend = "down"
         else:
             trend = "flat"
@@ -609,15 +636,31 @@ class ScalperBot:
         return {"trend": trend, "change": change}
 
     def _log_skip(self, sym: str, reason: str, feat: dict, extra: str = "") -> None:
+        """
+        Rate-limited skip logger so you see WHY the bot is not trading.
+        """
         now = time.time()
         key = f"{sym}:{reason}"
         last = self.last_skip_log.get(key, 0.0)
         if now - last < SKIP_LOG_COOLDOWN:
-            return
+            return  # only log same reason every few seconds per symbol
 
         self.last_skip_log[key] = now
+        mid = feat.get("mid", 0.0)
+        spread = feat.get("spread", 0.0)
+        imb = feat.get("imbalance", 0.0)
+        burst = feat.get("burst", 0.0)
+        b_micro = feat.get("burst_micro", 0.0)
+        rng = feat.get("range_pct", 0.0)
+        slope = feat.get("burst_slope", 0.0)
+        tcount = feat.get("trade_count", 0)
+        tvel = feat.get("trade_velocity", 0.0)
+
         msg = (
-            f"[SKIP] {sym} {reason} {extra}"
+            f"[SKIP] {sym} {reason} {extra} | "
+            f"mid={mid:.4f} spread={spread:.6f} "
+            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} "
+            f"slope={slope:.4f} trades={tcount} vel={tvel:.2f} rng={rng:.6f}"
         )
         print(msg, flush=True)
 
@@ -632,8 +675,11 @@ class ScalperBot:
             f"🟢 Bot started ({BOT_VERSION}). Equity: {eq:.2f} USDT. "
             f"Kill at {KILL_SWITCH_DD*100:.1f}% DD."
         )
+        # set leverage for all symbols
         for s in SYMBOLS_WS:
             await self.exchange.set_leverage(s, LEVERAGE)
+        print("[INIT] Leverage set for all symbols.")
+        await send_telegram("⚙️ Leverage set for all symbols.")
 
     async def maybe_kill_switch(self):
         if self.start_equity is None:
@@ -645,6 +691,9 @@ class ScalperBot:
         if dd >= KILL_SWITCH_DD:
             if self.position:
                 await self.exchange.close_position_market(self.position.symbol_ws)
+                await send_telegram(
+                    f"🚨 Kill-switch: equity drawdown {dd*100:.2f}%. Position closed."
+                )
                 self.position = None
             raise SystemExit("Kill-switch triggered")
 
@@ -652,17 +701,20 @@ class ScalperBot:
     # main decision loop
     # -------------------------------------------------
     async def eval_symbols_and_maybe_enter(self):
-
+        """
+        Scan all symbols, compute features, pick the best one and open position.
+        Only runs when there is NO open position.
+        """
         if self.position is not None:
             return
 
         best_score = 0.0
-        best_sym = None
-        best_feat = None
-        best_side = None
+        best_sym: Optional[str] = None
+        best_feat: Optional[dict] = None
+        best_side: Optional[str] = None
         now = time.time()
 
-        # BTC Guard
+        # ---------- BTC Volatility Guard ----------
         btc_buf = self.price_1m.get("BTCUSDT")
         if btc_buf and len(btc_buf) >= 2:
             p_first = btc_buf[0][1]
@@ -670,6 +722,14 @@ class ScalperBot:
             if p_first > 0:
                 btc_change = abs(p_last - p_first) / p_first
                 if btc_change > BTC_VOL_GUARD_PCT:
+                    if now - self.last_btc_guard_ts > 10.0:
+                        self.last_btc_guard_ts = now
+                        print(
+                            f"[GUARD] BTC 1m move={btc_change:.4f} > "
+                            f"{BTC_VOL_GUARD_PCT:.4f} -> skip entries",
+                            flush=True
+                        )
+                    await self.maybe_heartbeat()
                     return
 
         for sym in SYMBOLS_WS:
@@ -678,42 +738,66 @@ class ScalperBot:
                 continue
 
             imb = feat["imbalance"]
-            burst = feat["burst"]
-            b_micro = feat["burst_micro"]
+            burst = feat["burst"]          # accumulation burst
+            b_micro = feat["burst_micro"]  # micro burst
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
             burst_slope = feat.get("burst_slope", 0.0)
             trade_count = feat.get("trade_count", 0)
+            trade_velocity = feat.get("trade_velocity", 0.0)  # currently just for logs
 
+            # update 1m/5m buffers
             self._update_price_buffers(sym, mid, now)
             ctx_1m = self._get_1m_context(sym)
             ctx_5m = self._get_5m_trend(sym)
 
-            # Basic Filters
+            # ---------------- BASIC FILTERS ----------------
             if spread <= 0 or spread > MAX_SPREAD:
+                self._log_skip(sym, "spread", feat, f"> MAX_SPREAD({MAX_SPREAD})")
                 continue
             if rng < MIN_RANGE_PCT:
-                continue
-            if abs(imb) < IMBALANCE_THRESH:
-                continue
-            if abs(burst) < BURST_ACCUM_MIN:
-                continue
-            if abs(b_micro) < BURST_MICRO_MIN:
-                continue
-            if trade_count < VEL_MIN_TRADES:
-                continue
-            if abs(burst_slope) < BURST_SLOPE_MIN:
+                self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})")
                 continue
 
+            # imbalance strength
+            if abs(imb) < IMBALANCE_THRESH:
+                self._log_skip(sym, "imbalance", feat, f"< {IMBALANCE_THRESH}")
+                continue
+
+            # burst confirmation: accumulation + micro
+            if abs(burst) < BURST_ACCUM_MIN:
+                self._log_skip(sym, "burst_accum", feat, f"< {BURST_ACCUM_MIN}")
+                continue
+            if abs(b_micro) < BURST_MICRO_MIN:
+                self._log_skip(sym, "burst_micro", feat, f"< {BURST_MICRO_MIN}")
+                continue
+
+            # ---------- Velocity confirmation ----------
+            if trade_count < VEL_MIN_TRADES:
+                self._log_skip(
+                    sym,
+                    "velocity",
+                    feat,
+                    f"trades={trade_count} < {VEL_MIN_TRADES}"
+                )
+                continue
+
+            # NEW: acceleration filter
+            if abs(burst_slope) < BURST_SLOPE_MIN:
+                self._log_skip(sym, "burst_slope", feat, f"< {BURST_SLOPE_MIN}")
+                continue
+
+            # ---------------- DIRECTION FROM ORDERFLOW ----------------
             if imb > 0 and burst > 0 and b_micro > 0 and burst_slope > 0:
                 side = "buy"
             elif imb < 0 and burst < 0 and b_micro < 0 and burst_slope < 0:
                 side = "sell"
             else:
+                self._log_skip(sym, "direction", feat, "imb/burst/micro/slope disagree")
                 continue
 
-            # Continuation
+            # ---------- Continuation filter (short-term price move) ----------
             buf1 = self.price_1m[sym]
             if len(buf1) >= 3:
                 p_old = buf1[-3][1]
@@ -721,55 +805,123 @@ class ScalperBot:
                 if p_old > 0:
                     price_chg = (p_new - p_old) / p_old
                     if side == "buy" and price_chg <= 0:
+                        self._log_skip(sym, "continuation", feat, "price not moving up")
                         continue
                     if side == "sell" and price_chg >= 0:
+                        self._log_skip(sym, "continuation", feat, "price not moving down")
                         continue
 
+            # ---------------- IMPULSE SCORE ----------------
             score = compute_momentum_score(imb, burst, spread)
             if score < SCORE_MIN:
+                self._log_skip(sym, "score", feat, f"{score:.3f} < {SCORE_MIN}")
                 continue
 
-            # 1m structure
+            # ---------------- STRUCTURE FILTER (1m S/R) ----------------
             if ctx_1m:
                 if side == "buy" and ctx_1m["near_resistance"]:
+                    self._log_skip(sym, "structure", feat, "long at 1m resistance")
                     continue
                 if side == "sell" and ctx_1m["near_support"]:
+                    self._log_skip(sym, "structure", feat, "short at 1m support")
                     continue
 
-            # 5m trend
+            # ---------------- TREND FILTER (5m bias) ----------------
             if ctx_5m:
                 trend = ctx_5m["trend"]
                 if trend == "up" and side == "sell":
+                    # allow only very strong counter-trend shorts
                     if score < SCORE_MIN * 1.8:
+                        self._log_skip(sym, "trend", feat, "uptrend, short too weak")
                         continue
                 if trend == "down" and side == "buy":
+                    # allow only very strong counter-trend longs
                     if score < SCORE_MIN * 1.8:
+                        self._log_skip(sym, "trend", feat, "downtrend, long too weak")
                         continue
 
             # ====================================================
-            # TP ROOM CHECK (ADDED PATCH)
+            # TP ROOM CHECK — we require room for at least ~0.60% move
+            # even though TP_PCT is 0.004 (0.40%)
             # ====================================================
             if ctx_1m:
                 if side == "buy":
                     distance_to_res = (ctx_1m["high"] - mid) / mid
-                    if distance_to_res < (TP_PCT + 0.0062):
+                    if distance_to_res < TARGET_MOVE_PCT:
+                        self._log_skip(
+                            sym,
+                            "no_tp_room_long",
+                            feat,
+                            f"room={distance_to_res:.4f} < target={TARGET_MOVE_PCT:.4f}"
+                        )
                         continue
                 if side == "sell":
                     distance_to_sup = (mid - ctx_1m["low"]) / mid
-                    if distance_to_sup < (TP_PCT + 0.0062):
+                    if distance_to_sup < TARGET_MOVE_PCT:
+                        self._log_skip(
+                            sym,
+                            "no_tp_room_short",
+                            feat,
+                            f"room={distance_to_sup:.4f} < target={TARGET_MOVE_PCT:.4f}"
+                        )
                         continue
-            # ====================================================
 
+            # ====================================================
+            # LIQUIDITY VACUUM FILTER (LV, 50% wall ratio)
+            # Uses top 5 bids/asks from current book
+            # ====================================================
+            book = self.mkt.books.get(sym, {"bids": {}, "asks": {}})
+            bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
+            asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
+            bid_vol = sum(q for _, q in bids_sorted)
+            ask_vol = sum(q for _, q in asks_sorted)
+
+            if side == "buy":
+                if bid_vol <= 0:
+                    self._log_skip(sym, "lv_no_bid_liq", feat, "")
+                    continue
+                wall_ratio = ask_vol / (bid_vol + 1e-9)
+                if wall_ratio > LV_MAX_WALL_RATIO:
+                    self._log_skip(
+                        sym,
+                        "lv_sell_wall",
+                        feat,
+                        f"ratio={wall_ratio:.2f} > {LV_MAX_WALL_RATIO:.2f}"
+                    )
+                    continue
+
+            if side == "sell":
+                if ask_vol <= 0:
+                    self._log_skip(sym, "lv_no_ask_liq", feat, "")
+                    continue
+                wall_ratio = bid_vol / (ask_vol + 1e-9)
+                if wall_ratio > LV_MAX_WALL_RATIO:
+                    self._log_skip(
+                        sym,
+                        "lv_buy_wall",
+                        feat,
+                        f"ratio={wall_ratio:.2f} > {LV_MAX_WALL_RATIO:.2f}"
+                    )
+                    continue
+
+            # choose best symbol by score
             if score > best_score:
                 best_score = score
                 best_sym = sym
                 best_feat = feat
                 best_side = side
 
-        if not best_sym:
+        if not best_sym or not best_feat or not best_side:
+            await self.maybe_heartbeat()
             return
 
-        await self.open_position(best_sym, best_feat, best_side)        
+        # tiny anti-spam: don't double-trigger same symbol in <0.5s
+        if now - self.mkt.last_signal_ts[best_sym] < 0.5:
+            return
+        self.mkt.last_signal_ts[best_sym] = now
+
+        await self.open_position(best_sym, best_feat, best_side)
+
     # -------------------------------------------------
     # order execution
     # -------------------------------------------------
