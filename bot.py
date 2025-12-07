@@ -541,28 +541,24 @@ class ScalperBot:
         self.last_trade_time: float = 0.0
         self.last_heartbeat_ts: float = 0.0
 
-        # price history buffers for 1m + 5m structure
         self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
         self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
 
-        # skip-log cooldown
         self.last_skip_log = LAST_SKIP_LOG
-
-        # BTC Guard
         self.last_btc_guard_ts: float = 0.0
 
     # -------------------------------------------------
-    # structure helpers
+    # helpers: structure + trend + logging
     # -------------------------------------------------
-    def _update_price_buffers(self, sym: str, mid: float, now: float):
+    def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
         buf1 = self.price_1m[sym]
         buf5 = self.price_5m[sym]
 
         buf1.append((now, mid))
         buf5.append((now, mid))
 
-        cutoff1 = now - 60
-        cutoff5 = now - 300
+        cutoff1 = now - 60.0
+        cutoff5 = now - 300.0
 
         while buf1 and buf1[0][0] < cutoff1:
             buf1.popleft()
@@ -579,15 +575,17 @@ class ScalperBot:
         rng = high - low
         if rng <= 0:
             return None
-        last = prices[-1]
-        pos = (last - low) / rng
+
+        last_price = prices[-1]
+        pos_in_range = (last_price - low) / rng
+
         return {
             "high": high,
             "low": low,
             "range": rng,
-            "pos": pos,
-            "near_support": pos <= 0.2,
-            "near_resistance": pos >= 0.8,
+            "pos": pos_in_range,
+            "near_support": pos_in_range <= 0.2,
+            "near_resistance": pos_in_range >= 0.8,
         }
 
     def _get_5m_trend(self, sym: str) -> Optional[dict]:
@@ -599,34 +597,41 @@ class ScalperBot:
         last = prices[-1]
         if first <= 0:
             return None
-        chg = (last - first) / first
-        if chg > 0.002:
+        change = (last - first) / first
+
+        if change > 0.002:
             trend = "up"
-        elif chg < -0.002:
+        elif change < -0.002:
             trend = "down"
         else:
             trend = "flat"
-        return {"trend": trend, "change": chg}
 
-    # -------------------------------------------------
-    # skip logger
-    # -------------------------------------------------
-    def _log_skip(self, sym, reason, feat, extra=""):
+        return {"trend": trend, "change": change}
+
+    def _log_skip(self, sym: str, reason: str, feat: dict, extra: str = "") -> None:
         now = time.time()
         key = f"{sym}:{reason}"
-        if now - self.last_skip_log.get(key, 0) < SKIP_LOG_COOLDOWN:
+        last = self.last_skip_log.get(key, 0.0)
+        if now - last < SKIP_LOG_COOLDOWN:
             return
+
         self.last_skip_log[key] = now
-        print(f"[SKIP] {sym} {reason} {extra}", flush=True)
+        msg = (
+            f"[SKIP] {sym} {reason} {extra}"
+        )
+        print(msg, flush=True)
 
     # -------------------------------------------------
-    # INIT + Kill
+    # lifecycle
     # -------------------------------------------------
     async def init_equity_and_leverage(self):
         eq = await self.exchange.fetch_equity()
         self.start_equity = eq
-        print(f"[INIT] Equity {eq:.2f}")
-
+        print(f"[INIT] Equity: {eq:.2f} USDT — {BOT_VERSION}")
+        await send_telegram(
+            f"🟢 Bot started ({BOT_VERSION}). Equity: {eq:.2f} USDT. "
+            f"Kill at {KILL_SWITCH_DD*100:.1f}% DD."
+        )
         for s in SYMBOLS_WS:
             await self.exchange.set_leverage(s, LEVERAGE)
 
@@ -634,39 +639,39 @@ class ScalperBot:
         if self.start_equity is None:
             return
         eq = await self.exchange.fetch_equity()
+        if self.start_equity <= 0:
+            return
         dd = (self.start_equity - eq) / self.start_equity
         if dd >= KILL_SWITCH_DD:
             if self.position:
                 await self.exchange.close_position_market(self.position.symbol_ws)
-            raise SystemExit("Kill switch")
+                self.position = None
+            raise SystemExit("Kill-switch triggered")
 
     # -------------------------------------------------
-    # MAIN DECISION LOOP
+    # main decision loop
     # -------------------------------------------------
     async def eval_symbols_and_maybe_enter(self):
-        if self.position:
+
+        if self.position is not None:
             return
 
-        best_score = 0
+        best_score = 0.0
         best_sym = None
         best_feat = None
         best_side = None
         now = time.time()
 
-        # ---------------- BTC VOLATILITY GUARD ----------------
+        # BTC Guard
         btc_buf = self.price_1m.get("BTCUSDT")
         if btc_buf and len(btc_buf) >= 2:
-            p1 = btc_buf[0][1]
-            p2 = btc_buf[-1][1]
-            if p1 > 0:
-                btc_move = abs(p2 - p1) / p1
-                if btc_move > BTC_VOL_GUARD_PCT:
-                    self.last_btc_guard_ts = now
+            p_first = btc_buf[0][1]
+            p_last = btc_buf[-1][1]
+            if p_first > 0:
+                btc_change = abs(p_last - p_first) / p_first
+                if btc_change > BTC_VOL_GUARD_PCT:
                     return
 
-        # ======================================================
-        #                SCAN ALL SYMBOLS
-        # ======================================================
         for sym in SYMBOLS_WS:
             feat = self.mkt.compute_features(sym)
             if not feat:
@@ -674,20 +679,19 @@ class ScalperBot:
 
             imb = feat["imbalance"]
             burst = feat["burst"]
-            micro = feat["burst_micro"]
+            b_micro = feat["burst_micro"]
             spread = feat["spread"]
             rng = feat["range_pct"]
             mid = feat["mid"]
-            slope = feat.get("burst_slope", 0.0)
-            trades = feat.get("trade_count", 0)
+            burst_slope = feat.get("burst_slope", 0.0)
+            trade_count = feat.get("trade_count", 0)
 
-            # update structure buffers
             self._update_price_buffers(sym, mid, now)
             ctx_1m = self._get_1m_context(sym)
             ctx_5m = self._get_5m_trend(sym)
 
-            # ---------------- BASIC FILTERS ----------------
-            if spread > MAX_SPREAD:
+            # Basic Filters
+            if spread <= 0 or spread > MAX_SPREAD:
                 continue
             if rng < MIN_RANGE_PCT:
                 continue
@@ -695,68 +699,67 @@ class ScalperBot:
                 continue
             if abs(burst) < BURST_ACCUM_MIN:
                 continue
-            if abs(micro) < BURST_MICRO_MIN:
+            if abs(b_micro) < BURST_MICRO_MIN:
                 continue
-            if trades < VEL_MIN_TRADES:
+            if trade_count < VEL_MIN_TRADES:
                 continue
-            if abs(slope) < BURST_SLOPE_MIN:
+            if abs(burst_slope) < BURST_SLOPE_MIN:
                 continue
 
-            # -------- DIRECTION --------
-            if imb > 0 and burst > 0 and micro > 0 and slope > 0:
+            if imb > 0 and burst > 0 and b_micro > 0 and burst_slope > 0:
                 side = "buy"
-            elif imb < 0 and burst < 0 and micro < 0 and slope < 0:
+            elif imb < 0 and burst < 0 and b_micro < 0 and burst_slope < 0:
                 side = "sell"
             else:
                 continue
 
-            # ---------- Continuation check ----------
+            # Continuation
             buf1 = self.price_1m[sym]
             if len(buf1) >= 3:
-                o = buf1[-3][1]
-                n = buf1[-1][1]
-                if o > 0:
-                    ch = (n - o) / o
-                    if side == "buy" and ch <= 0:
+                p_old = buf1[-3][1]
+                p_new = buf1[-1][1]
+                if p_old > 0:
+                    price_chg = (p_new - p_old) / p_old
+                    if side == "buy" and price_chg <= 0:
                         continue
-                    if side == "sell" and ch >= 0:
+                    if side == "sell" and price_chg >= 0:
                         continue
 
-            # ---------- SCORE ----------
             score = compute_momentum_score(imb, burst, spread)
             if score < SCORE_MIN:
                 continue
 
-            # ---------- 1m STRUCTURE ----------
+            # 1m structure
             if ctx_1m:
                 if side == "buy" and ctx_1m["near_resistance"]:
                     continue
                 if side == "sell" and ctx_1m["near_support"]:
                     continue
 
-            # ---------- 5m TREND ----------
+            # 5m trend
             if ctx_5m:
-                tr = ctx_5m["trend"]
-                if tr == "up" and side == "sell" and score < SCORE_MIN * 1.8:
-                    continue
-                if tr == "down" and side == "buy" and score < SCORE_MIN * 1.8:
-                    continue
+                trend = ctx_5m["trend"]
+                if trend == "up" and side == "sell":
+                    if score < SCORE_MIN * 1.8:
+                        continue
+                if trend == "down" and side == "buy":
+                    if score < SCORE_MIN * 1.8:
+                        continue
 
             # ====================================================
-            # TP ROOM CHECK (PATCH)
+            # TP ROOM CHECK (ADDED PATCH)
             # ====================================================
             if ctx_1m:
                 if side == "buy":
-                    dist = (ctx_1m["high"] - mid) / mid
-                    if dist < (TP_PCT + 0.0002):
+                    distance_to_res = (ctx_1m["high"] - mid) / mid
+                    if distance_to_res < (TP_PCT + 0.0002):
                         continue
                 if side == "sell":
-                    dist = (mid - ctx_1m["low"]) / mid
-                    if dist < (TP_PCT + 0.0002):
+                    distance_to_sup = (mid - ctx_1m["low"]) / mid
+                    if distance_to_sup < (TP_PCT + 0.0002):
                         continue
             # ====================================================
 
-            # -------- choose best by score --------
             if score > best_score:
                 best_score = score
                 best_sym = sym
@@ -766,13 +769,7 @@ class ScalperBot:
         if not best_sym:
             return
 
-        # anti spam
-        if now - self.mkt.last_signal_ts[best_sym] < 0.5:
-            return
-        self.mkt.last_signal_ts[best_sym] = now
-
-        await self.open_position(best_sym, best_feat, best_side)
-        
+        await self.open_position(best_sym, best_feat, best_side)        
     # -------------------------------------------------
     # order execution
     # -------------------------------------------------
