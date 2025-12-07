@@ -752,11 +752,11 @@ class ScalperBot:
             if ctx_1m:
                 if side == "buy":
                     distance_to_res = (ctx_1m["high"] - mid) / mid
-                    if distance_to_res < (TP_PCT + 0.0002):
+                    if distance_to_res < (TP_PCT + 0.0062):
                         continue
                 if side == "sell":
                     distance_to_sup = (mid - ctx_1m["low"]) / mid
-                    if distance_to_sup < (TP_PCT + 0.0002):
+                    if distance_to_sup < (TP_PCT + 0.0062):
                         continue
             # ====================================================
 
