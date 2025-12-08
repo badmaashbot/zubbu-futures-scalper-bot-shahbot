@@ -1367,8 +1367,11 @@ async def main():
 if __name__ == "__main__":
     try:
         import uvloop  # optional, for speed
-
         uvloop.install()
     except Exception:
         pass
-    asyncio.run(main())
+
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        pass
