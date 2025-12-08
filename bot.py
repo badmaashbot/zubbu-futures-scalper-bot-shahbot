@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (with TP room + LV filter)
+ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (with TP room + LV filter + Ladder SL)
 
 Core Logic:
 -----------
@@ -14,8 +14,8 @@ Core Logic:
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
 - Single open position at a time (best symbol chosen)
-- FIXED TP = +0.40%
-- FIXED SL = -0.30% (hard stop via watchdog)
+- FIXED TP = +0.60%
+- NO STATIC SL: dynamic ladder SL handles risk
 - TP room filter (requires ~0.60% space in 1m range)
 - Liquidity Vacuum (LV) filter: opposite wall max 50%
 - Detailed skip logs (rate-limited) so you can see WHY it skipped
@@ -35,7 +35,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP"
+BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP_LADDER"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -73,11 +73,12 @@ else:
 # --------------- TRADING CONFIG -----------------
 
 LEVERAGE = 3
-EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notional
+EQUITY_USE_FRACTION = 0.97  # use up to 97% equity * leverage as position notional
 
-# Fixed SL / TP (decimal, relative to entry)
-SL_PCT = 0.0030   # 0.30% hard stop
-TP_PCT = 0.0020   # 0.20% take profit
+# Fixed TP (decimal, relative to entry)
+TP_PCT = 0.0060   # 0.60% take profit
+
+# SL_PCT = 0.0030   # 0.30%  Stop loss
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
 SCORE_MIN        = 0.90    # impulse score threshold (you can raise to 1.5 if you want tighter)
@@ -117,7 +118,7 @@ BTC_VOL_GUARD_PCT = 0.004  # 0.40% in 1 minute
 VEL_MIN_TRADES   = 8       # minimum trades in last 5s
 BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
 
-# TP room expectation: we want space for ~0.60% move even though TP is 0.40%
+# TP room expectation: we want space for ~0.60% move even though TP is 0.60%
 TARGET_MOVE_PCT   = 0.006  # 0.60% target room
 
 # Liquidity vacuum
@@ -714,6 +715,14 @@ class ScalperBot:
         best_side: Optional[str] = None
         now = time.time()
 
+        # ======== BTC BUFFER REFRESH FIX ========
+        btc_buf = self.price_1m.get("BTCUSDT")
+        if btc_buf and len(btc_buf) > 2:
+            # If buffer has very old values, reset it so guard turns OFF properly
+            if now - btc_buf[0][0] > 75:
+                print("[GUARD RESET] BTC history stale — refreshing buffer")
+                btc_buf.clear()
+
         # ---------- BTC Volatility Guard ----------
         btc_buf = self.price_1m.get("BTCUSDT")
         if btc_buf and len(btc_buf) >= 2:
@@ -842,7 +851,6 @@ class ScalperBot:
 
             # ====================================================
             # TP ROOM CHECK — we require room for at least ~0.60% move
-            # even though TP_PCT is 0.004 (0.40%)
             # ====================================================
             if ctx_1m:
                 if side == "buy":
@@ -927,7 +935,7 @@ class ScalperBot:
     # -------------------------------------------------
     async def open_position(self, sym_ws: str, feat: dict, side: str):
         """
-        Open a new position with FIXED TP and FIXED SL (watchdog-based SL).
+        Open a new position with FIXED TP and dynamic ladder SL (watchdog-based).
         """
         try:
             equity = await self.exchange.fetch_equity()
@@ -966,13 +974,14 @@ class ScalperBot:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
-        # recompute TP / SL from actual entry
+        # recompute TP / initial wide SL from actual entry
         if side == "buy":
             tp_price = entry_price * (1.0 + TP_PCT)
-            sl_price = entry_price * (1.0 - SL_PCT)
+            # wide temporary SL (1%) - real SL will be handled by ladder in watchdog
+            sl_price = entry_price * 0.990
         else:
             tp_price = entry_price * (1.0 - TP_PCT)
-            sl_price = entry_price * (1.0 + SL_PCT)
+            sl_price = entry_price * 1.010
 
         # TP as limit reduce-only maker
         opp_side = "sell" if side == "buy" else "buy"
@@ -1001,20 +1010,20 @@ class ScalperBot:
         self.last_trade_time = time.time()
         print(
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
+            f"TP={tp_price:.4f} SL_init≈{sl_price:.4f}"
         )
         await send_telegram(
             f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL≈{sl_price:.4f}"
+            f"TP={tp_price:.4f} (dynamic ladder SL)"
         )
 
     # -------------------------------------------------
-    # risk watchdog: detect TP/SL hits + backup SL
+    # risk watchdog: detect TP/SL hits + backup SL + ladder trail
     # -------------------------------------------------
     async def watchdog_position(self):
         """
         - Detect if exchange closed position (TP hit or SL hit)
-        - If still open, apply backup SL check
+        - If still open, apply ladder dynamic SL + backup SL check
         """
         if not self.position:
             return
@@ -1040,9 +1049,9 @@ class ScalperBot:
 
                 # Profit or loss detection
                 if move > 0:
-                    reason = "TP filled (profit)"
+                    reason = "TP filled (profit/ladder)"
                 else:
-                    reason = "SL filled (loss)"
+                    reason = "SL filled (loss/ladder)"
 
             # -------- LOG & TELEGRAM --------
             print(
@@ -1066,7 +1075,66 @@ class ScalperBot:
         if mid <= 0:
             return
 
-        # ========== 3) BACKUP SL CHECK ==========
+        # ========== 3) DYNAMIC LADDER SL UPDATE ==========
+        entry = pos.entry_price
+
+        # profit calculation
+        if pos.side == "buy":
+            profit_pct = (mid - entry) / entry
+        else:
+            profit_pct = (entry - mid) / entry
+
+        new_sl = pos.sl_price
+        reason = None
+
+        # ----- Level 1: +0.20% -> SL to entry -----
+        if profit_pct >= 0.0020:
+            if pos.side == "buy":
+                target_sl = entry
+                if target_sl > new_sl:
+                    new_sl = target_sl
+                    reason = "L1: SL → breakeven"
+            else:
+                target_sl = entry
+                if target_sl < new_sl:
+                    new_sl = target_sl
+                    reason = "L1: SL → breakeven"
+
+        # ----- Level 2: +0.40% -> SL to +0.20% -----
+        if profit_pct >= 0.0040:
+            if pos.side == "buy":
+                target_sl = entry * 1.0020  # +0.20%
+                if target_sl > new_sl:
+                    new_sl = target_sl
+                    reason = "L2: SL → +0.20%"
+            else:
+                target_sl = entry * 0.9980  # -0.20%
+                if target_sl < new_sl:
+                    new_sl = target_sl
+                    reason = "L2: SL → +0.20%"
+
+        # ----- Level 3: +0.60% -> SL to +0.40% -----
+        if profit_pct >= 0.0060:
+            if pos.side == "buy":
+                target_sl = entry * 1.0040  # +0.40%
+                if target_sl > new_sl:
+                    new_sl = target_sl
+                    reason = "L3: SL → +0.40%"
+            else:
+                target_sl = entry * 0.9960  # -0.40%
+                if target_sl < new_sl:
+                    new_sl = target_sl
+                    reason = "L3: SL → +0.40%"
+
+        # ----- If SL updated -> apply -----
+        if new_sl != pos.sl_price:
+            pos.sl_price = new_sl
+            print(f"[LADDER SL] {sym} {reason}, new SL={new_sl:.4f}")
+            await send_telegram(
+                f"🔁 {sym} {reason} — SL updated to {new_sl:.4f}"
+            )
+
+        # ========== 4) BACKUP SL CHECK ==========
         hit = False
 
         # long backup SL
