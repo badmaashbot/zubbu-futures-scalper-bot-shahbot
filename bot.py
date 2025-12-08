@@ -77,7 +77,7 @@ EQUITY_USE_FRACTION = 0.95  # use up to 95% equity * leverage as position notion
 
 # Fixed SL / TP (decimal, relative to entry)
 SL_PCT = 0.0030   # 0.30% hard stop
-TP_PCT = 0.0040   # 0.40% take profit
+TP_PCT = 0.0020   # 0.20% take profit
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
 SCORE_MIN        = 0.90    # impulse score threshold (you can raise to 1.5 if you want tighter)
@@ -121,7 +121,7 @@ BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
 TARGET_MOVE_PCT   = 0.006  # 0.60% target room
 
 # Liquidity vacuum
-LV_MAX_WALL_RATIO = 0.40   # opposite wall max 40% of our side liqudity
+LV_MAX_WALL_RATIO = 0.20   # opposite wall max 20% of our side liqudity
 
 # --------------- TELEGRAM -----------------
 
