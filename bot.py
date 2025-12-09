@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.3_FIXEDTP – Full bot.py (with TP room + LV filter + Ladder SL)
+ZUBBU_SCALPER_V4.4_HTF – Full bot.py (with TP room + LV filter + Ladder SL + real SL_PCT + 15m trend)
 
 Core Logic:
 -----------
@@ -13,12 +13,15 @@ Core Logic:
     * score = |imbalance| * |accum_burst| / spread
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
+- 15m higher-timeframe trend filter (strong bias filter)
 - Single open position at a time (best symbol chosen)
 - FIXED TP = +0.60%
-- NO STATIC SL: dynamic ladder SL handles risk
+- STATIC SL based on SL_PCT + dynamic ladder SL
 - TP room filter (requires ~0.60% space in 1m range)
 - Liquidity Vacuum (LV) filter: opposite wall max 50%
 - Detailed skip logs (rate-limited) so you can see WHY it skipped
+
+NOTE: This is an experimental strategy. Use TESTNET or very small size first.
 """
 
 import os
@@ -35,7 +38,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.3_FIXEDTP_LADDER"
+BOT_VERSION = "ZUBBU_SCALPER_V4.4_HTF"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -72,16 +75,17 @@ else:
 
 # --------------- TRADING CONFIG -----------------
 
-LEVERAGE = 3
+LEVERAGE = 5
 EQUITY_USE_FRACTION = 0.97  # use up to 97% equity * leverage as position notional
 
 # Fixed TP (decimal, relative to entry)
 TP_PCT = 0.0060   # 0.60% take profit
 
-# SL_PCT = 0.0030   # 0.30%  Stop loss
+# Static SL, actually used now
+SL_PCT = 0.0030   # 0.30% stop loss
 
 # --- Orderflow filters (balanced-aggressive, with accumulation) ---
-SCORE_MIN        = 0.90    # impulse score threshold (you can raise to 1.5 if you want tighter)
+SCORE_MIN        = 0.90    # impulse score threshold
 IMBALANCE_THRESH = 0.06    # 6% imbalance
 BURST_MICRO_MIN  = 0.030   # micro burst (0.35s) minimum
 BURST_ACCUM_MIN  = 0.060   # accumulation burst (5s) minimum
@@ -118,11 +122,15 @@ BTC_VOL_GUARD_PCT = 0.004  # 0.40% in 1 minute
 VEL_MIN_TRADES   = 8       # minimum trades in last 5s
 BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
 
-# TP room expectation: we want space for ~0.60% move even though TP is 0.60%
+# TP room expectation: we want space for ~0.60% move
 TARGET_MOVE_PCT   = 0.006  # 0.60% target room
 
 # Liquidity vacuum
 LV_MAX_WALL_RATIO = 0.20   # opposite wall max 20% of our side liqudity
+
+# 15m trend thresholds
+TREND_5M_THRESH   = 0.002   # 0.20%
+TREND_15M_THRESH  = 0.004   # 0.40%
 
 # --------------- TELEGRAM -----------------
 
@@ -550,9 +558,10 @@ class ScalperBot:
         self.last_trade_time: float = 0.0
         self.last_heartbeat_ts: float = 0.0
 
-        # price history buffers for 1m + 5m structure
+        # price history buffers for 1m + 5m + 15m structure
         self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
         self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
+        self.price_15m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
 
         # skip-log cooldown (local reference)
         self.last_skip_log = LAST_SKIP_LOG
@@ -564,20 +573,25 @@ class ScalperBot:
     # helpers: structure + trend + logging
     # -------------------------------------------------
     def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
-        """Keep 1m + 5m rolling mid-price history."""
+        """Keep 1m + 5m + 15m rolling mid-price history."""
         buf1 = self.price_1m[sym]
         buf5 = self.price_5m[sym]
+        buf15 = self.price_15m[sym]
 
         buf1.append((now, mid))
         buf5.append((now, mid))
+        buf15.append((now, mid))
 
         cutoff1 = now - 60.0       # 1 minute
         cutoff5 = now - 300.0      # 5 minutes
+        cutoff15 = now - 900.0     # 15 minutes
 
         while buf1 and buf1[0][0] < cutoff1:
             buf1.popleft()
         while buf5 and buf5[0][0] < cutoff5:
             buf5.popleft()
+        while buf15 and buf15[0][0] < cutoff15:
+            buf15.popleft()
 
     def _get_1m_context(self, sym: str) -> Optional[dict]:
         """
@@ -627,9 +641,35 @@ class ScalperBot:
 
         change = (last - first) / first
 
-        if change > 0.002:      # +0.2% or more = uptrend
+        if change > TREND_5M_THRESH:
             trend = "up"
-        elif change < -0.002:   # -0.2% or more = downtrend
+        elif change < -TREND_5M_THRESH:
+            trend = "down"
+        else:
+            trend = "flat"
+
+        return {"trend": trend, "change": change}
+
+    def _get_15m_trend(self, sym: str) -> Optional[dict]:
+        """
+        Returns 15m higher timeframe trend:
+          - trend: "up", "down", "flat"
+        """
+        buf = self.price_15m[sym]
+        if len(buf) < 10:
+            return None
+
+        prices = [p for _, p in buf]
+        first = prices[0]
+        last = prices[-1]
+        if first <= 0:
+            return None
+
+        change = (last - first) / first
+
+        if change > TREND_15M_THRESH:
+            trend = "up"
+        elif change < -TREND_15M_THRESH:
             trend = "down"
         else:
             trend = "flat"
@@ -756,10 +796,11 @@ class ScalperBot:
             trade_count = feat.get("trade_count", 0)
             trade_velocity = feat.get("trade_velocity", 0.0)  # currently just for logs
 
-            # update 1m/5m buffers
+            # update 1m/5m/15m buffers
             self._update_price_buffers(sym, mid, now)
             ctx_1m = self._get_1m_context(sym)
             ctx_5m = self._get_5m_trend(sym)
+            ctx_15m = self._get_15m_trend(sym)
 
             # ---------------- BASIC FILTERS ----------------
             if spread <= 0 or spread > MAX_SPREAD:
@@ -841,12 +882,25 @@ class ScalperBot:
                 if trend == "up" and side == "sell":
                     # allow only very strong counter-trend shorts
                     if score < SCORE_MIN * 1.8:
-                        self._log_skip(sym, "trend", feat, "uptrend, short too weak")
+                        self._log_skip(sym, "trend_5m", feat, "uptrend, short too weak")
                         continue
                 if trend == "down" and side == "buy":
                     # allow only very strong counter-trend longs
                     if score < SCORE_MIN * 1.8:
-                        self._log_skip(sym, "trend", feat, "downtrend, long too weak")
+                        self._log_skip(sym, "trend_5m", feat, "downtrend, long too weak")
+                        continue
+
+            # ---------------- HIGHER TIMEFRAME FILTER (15m bias) ----------------
+            if ctx_15m:
+                t15 = ctx_15m["trend"]
+                if t15 == "up" and side == "sell":
+                    # require even stronger signal to go against 15m uptrend
+                    if score < SCORE_MIN * 2.2:
+                        self._log_skip(sym, "trend_15m", feat, "15m uptrend, short too weak")
+                        continue
+                if t15 == "down" and side == "buy":
+                    if score < SCORE_MIN * 2.2:
+                        self._log_skip(sym, "trend_15m", feat, "15m downtrend, long too weak")
                         continue
 
             # ====================================================
@@ -935,7 +989,7 @@ class ScalperBot:
     # -------------------------------------------------
     async def open_position(self, sym_ws: str, feat: dict, side: str):
         """
-        Open a new position with FIXED TP and dynamic ladder SL (watchdog-based).
+        Open a new position with FIXED TP, STATIC SL and dynamic ladder SL.
         """
         try:
             equity = await self.exchange.fetch_equity()
@@ -974,14 +1028,13 @@ class ScalperBot:
             await send_telegram(f"❌ Entry failed for {sym_ws}")
             return
 
-        # recompute TP / initial wide SL from actual entry
+        # recompute TP / SL from actual entry
         if side == "buy":
             tp_price = entry_price * (1.0 + TP_PCT)
-            # wide temporary SL (1%) - real SL will be handled by ladder in watchdog
-            sl_price = entry_price * 0.990
+            sl_price = entry_price * (1.0 - SL_PCT)
         else:
             tp_price = entry_price * (1.0 - TP_PCT)
-            sl_price = entry_price * 1.010
+            sl_price = entry_price * (1.0 + SL_PCT)
 
         # TP as limit reduce-only maker
         opp_side = "sell" if side == "buy" else "buy"
@@ -1010,11 +1063,11 @@ class ScalperBot:
         self.last_trade_time = time.time()
         print(
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL_init≈{sl_price:.4f}"
+            f"TP={tp_price:.4f} SL={sl_price:.4f}"
         )
         await send_telegram(
             f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} (dynamic ladder SL)"
+            f"TP={tp_price:.4f} SL={sl_price:.4f} (ladder enabled)"
         )
 
     # -------------------------------------------------
