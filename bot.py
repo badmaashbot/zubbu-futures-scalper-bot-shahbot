@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-ZUBBU_SCALPER_V4.4_HTF – Full bot.py (with TP room + LV filter + Ladder SL + real SL_PCT + 15m trend)
+ZUBBU_SCALPER_V4.5_HTF – Full bot.py
+(with CONFIRMATION, TP room, LV filter, Ladder SL, real SL_PCT, 5m + 15m trend,
+cooldown after exit, simple footprint spoof filter, 0.25s eval, ~0.5s watchdog)
 
 Core Logic:
 -----------
@@ -13,12 +15,15 @@ Core Logic:
     * score = |imbalance| * |accum_burst| / spread
 - 1m structure filter (support/resistance zones)
 - 5m trend filter (up / down / flat)
-- 15m higher-timeframe trend filter (strong bias filter)
+- 15m higher-timeframe trend filter (strong bias filter, slightly relaxed)
 - Single open position at a time (best symbol chosen)
-- FIXED TP = +0.60%
+- Adaptive TP (0.40% / 0.60% depending on micro-range)
 - STATIC SL based on SL_PCT + dynamic ladder SL
-- TP room filter (requires ~0.60% space in 1m range)
-- Liquidity Vacuum (LV) filter: opposite wall max 50%
+- TP room filter (requires ~0.30% space in 1m range)
+- Liquidity Vacuum (LV) filter: opposite wall max 20%
+- Simple spoof / absorption footprint filter based on fast liq changes
+- Confirmation delay before entry (~0.5s)
+- Cooldown after exits (TP / SL) to avoid back-to-back traps
 - Detailed skip logs (rate-limited) so you can see WHY it skipped
 
 NOTE: This is an experimental strategy. Use TESTNET or very small size first.
@@ -38,7 +43,7 @@ import aiohttp
 import ccxt  # sync ccxt, we wrap blocking calls with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SCALPER_V4.4_HTF"
+BOT_VERSION = "ZUBBU_SCALPER_V4.5_HTF"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -77,9 +82,6 @@ else:
 
 LEVERAGE = 5
 EQUITY_USE_FRACTION = 0.97  # use up to 97% equity * leverage as position notional
-
-# Fixed TP (decimal, relative to entry)
-TP_PCT = 0.0060   # 0.60% take profit
 
 # Static SL, actually used now
 SL_PCT = 0.0030   # 0.30% stop loss
@@ -122,15 +124,24 @@ BTC_VOL_GUARD_PCT = 0.004  # 0.40% in 1 minute
 VEL_MIN_TRADES   = 8       # minimum trades in last 5s
 BURST_SLOPE_MIN  = 0.003   # minimum net acceleration of burst (tune if needed)
 
-# TP room expectation: we want space for ~0.60% move
-TARGET_MOVE_PCT   = 0.006  # 0.60% target room
+# TP room expectation: we want space for ~0.30% move (more realistic)
+TARGET_MOVE_PCT   = 0.003  # 0.30% target room
 
 # Liquidity vacuum
-LV_MAX_WALL_RATIO = 0.20   # opposite wall max 20% of our side liqudity
+LV_MAX_WALL_RATIO = 0.20   # opposite wall max 20% of our side liquidity
 
-# 15m trend thresholds
+# 5m / 15m trend thresholds
 TREND_5M_THRESH   = 0.002   # 0.20%
 TREND_15M_THRESH  = 0.004   # 0.40%
+
+# --------------- NEW CONTROL CONSTANTS -----------------
+
+# Confirmation delay: wait after first signal before entering
+CONFIRMATION_DELAY = 0.50  # seconds
+
+# Cooldowns after exits
+COOLDOWN_SL = 25.0   # seconds after loss
+COOLDOWN_TP = 10.0   # seconds after TP / positive exit
 
 # --------------- TELEGRAM -----------------
 
@@ -569,6 +580,20 @@ class ScalperBot:
         # BTC volatility guard last log
         self.last_btc_guard_ts: float = 0.0
 
+        # pending entry for confirmation delay
+        self.pending_entry: Optional[dict] = None
+
+        # exit cooldown state
+        self.last_exit_ts: float = 0.0
+        self.last_exit_was_loss: bool = False
+
+        # last watchdog timestamp (for 0.5s-ish frequency)
+        self.last_watchdog_ts: float = 0.0
+
+        # simple liquidity footprint memory per symbol
+        # to detect sudden spoof walls or disappearing absorption
+        self.last_liq_state: Dict[str, Optional[dict]] = {s: None for s in SYMBOLS_WS}
+
     # -------------------------------------------------
     # helpers: structure + trend + logging
     # -------------------------------------------------
@@ -743,17 +768,22 @@ class ScalperBot:
     # -------------------------------------------------
     async def eval_symbols_and_maybe_enter(self):
         """
-        Scan all symbols, compute features, pick the best one and open position.
-        Only runs when there is NO open position.
+        Scan all symbols, compute features, pick the best one,
+        set a pending signal, and after CONFIRMATION_DELAY open position.
+        Only runs when there is NO open position and cooldown allows it.
         """
         if self.position is not None:
             return
 
-        best_score = 0.0
-        best_sym: Optional[str] = None
-        best_feat: Optional[dict] = None
-        best_side: Optional[str] = None
         now = time.time()
+
+        # ----- EXIT COOLDOWN -----
+        if self.last_exit_ts > 0.0:
+            cooldown = COOLDOWN_SL if self.last_exit_was_loss else COOLDOWN_TP
+            if now - self.last_exit_ts < cooldown:
+                # cooling after recent exit
+                await self.maybe_heartbeat()
+                return
 
         # ======== BTC BUFFER REFRESH FIX ========
         btc_buf = self.price_1m.get("BTCUSDT")
@@ -780,6 +810,78 @@ class ScalperBot:
                         )
                     await self.maybe_heartbeat()
                     return
+
+        # ---------- PENDING ENTRY CONFIRMATION ----------
+        if self.pending_entry:
+            pe = self.pending_entry
+            if now - pe["ts"] >= CONFIRMATION_DELAY:
+                sym = pe["symbol"]
+                side = pe["side"]
+                feat_new = self.mkt.compute_features(sym)
+                if not feat_new:
+                    # data stale or missing, drop signal
+                    self.pending_entry = None
+                else:
+                    imb = feat_new["imbalance"]
+                    burst = feat_new["burst"]
+                    micro = feat_new["burst_micro"]
+                    slope = feat_new.get("burst_slope", 0.0)
+                    spread = feat_new["spread"]
+
+                    # direction must still align
+                    if side == "buy":
+                        if not (imb > 0 and burst > 0 and micro > 0 and slope > 0):
+                            self._log_skip(
+                                sym, "confirm_dir",
+                                feat_new,
+                                "direction flipped before confirm (LONG)"
+                            )
+                            self.pending_entry = None
+                        else:
+                            score = compute_momentum_score(imb, burst, spread)
+                            if score < SCORE_MIN:
+                                self._log_skip(
+                                    sym, "confirm_score",
+                                    feat_new,
+                                    f"{score:.3f} < {SCORE_MIN}"
+                                )
+                                self.pending_entry = None
+                            else:
+                                await self.open_position(sym, feat_new, side)
+                                self.pending_entry = None
+                                return
+                    else:  # side == "sell"
+                        if not (imb < 0 and burst < 0 and micro < 0 and slope < 0):
+                            self._log_skip(
+                                sym, "confirm_dir",
+                                feat_new,
+                                "direction flipped before confirm (SHORT)"
+                            )
+                            self.pending_entry = None
+                        else:
+                            score = compute_momentum_score(imb, burst, spread)
+                            if score < SCORE_MIN:
+                                self._log_skip(
+                                    sym, "confirm_score",
+                                    feat_new,
+                                    f"{score:.3f} < {SCORE_MIN}"
+                                )
+                                self.pending_entry = None
+                            else:
+                                await self.open_position(sym, feat_new, side)
+                                self.pending_entry = None
+                                return
+
+            # If still waiting for confirmation time, don't search new signals
+            if self.pending_entry:
+                await self.maybe_heartbeat()
+                return
+
+        # ---------- NORMAL SCAN: find best new signal ----------
+        best_score = 0.0
+        best_sym: Optional[str] = None
+        best_feat: Optional[dict] = None
+        best_side: Optional[str] = None
 
         for sym in SYMBOLS_WS:
             feat = self.mkt.compute_features(sym)
@@ -833,7 +935,7 @@ class ScalperBot:
                 )
                 continue
 
-            # NEW: acceleration filter
+            # acceleration filter
             if abs(burst_slope) < BURST_SLOPE_MIN:
                 self._log_skip(sym, "burst_slope", feat, f"< {BURST_SLOPE_MIN}")
                 continue
@@ -894,17 +996,17 @@ class ScalperBot:
             if ctx_15m:
                 t15 = ctx_15m["trend"]
                 if t15 == "up" and side == "sell":
-                    # require even stronger signal to go against 15m uptrend
-                    if score < SCORE_MIN * 2.2:
+                    # require strong signal to go against 15m uptrend (relaxed vs old 2.2x)
+                    if score < SCORE_MIN * 1.7:
                         self._log_skip(sym, "trend_15m", feat, "15m uptrend, short too weak")
                         continue
                 if t15 == "down" and side == "buy":
-                    if score < SCORE_MIN * 2.2:
+                    if score < SCORE_MIN * 1.7:
                         self._log_skip(sym, "trend_15m", feat, "15m downtrend, long too weak")
                         continue
 
             # ====================================================
-            # TP ROOM CHECK — we require room for at least ~0.60% move
+            # TP ROOM CHECK — we require room for at least ~0.30% move
             # ====================================================
             if ctx_1m:
                 if side == "buy":
@@ -929,7 +1031,7 @@ class ScalperBot:
                         continue
 
             # ====================================================
-            # LIQUIDITY VACUUM FILTER (LV, 50% wall ratio)
+            # LIQUIDITY VACUUM + SIMPLE FOOTPRINT / SPOOF CHECK
             # Uses top 5 bids/asks from current book
             # ====================================================
             book = self.mkt.books.get(sym, {"bids": {}, "asks": {}})
@@ -938,6 +1040,70 @@ class ScalperBot:
             bid_vol = sum(q for _, q in bids_sorted)
             ask_vol = sum(q for _, q in asks_sorted)
 
+            now_ts = now
+            prev_liq = self.last_liq_state.get(sym)
+            if prev_liq is not None:
+                dt = now_ts - prev_liq["ts"]
+                if 0 < dt < 0.35:
+                    prev_bid = prev_liq["bid_vol"]
+                    prev_ask = prev_liq["ask_vol"]
+                    prev_mid = prev_liq["mid"]
+                    price_change = 0.0
+                    if mid > 0:
+                        price_change = abs(mid - prev_mid) / mid
+
+                    # if opposite wall suddenly spikes by >60% with almost no price move in <0.35s -> spoof
+                    if price_change < 0.0005:
+                        if side == "buy":
+                            if prev_ask > 0 and ask_vol > prev_ask * 1.6:
+                                self._log_skip(sym, "spoof_ask_wall", feat, "")
+                                self.last_liq_state[sym] = {
+                                    "bid_vol": bid_vol,
+                                    "ask_vol": ask_vol,
+                                    "mid": mid,
+                                    "ts": now_ts,
+                                }
+                                continue
+                            # lack of bid absorption (iceberg vanished)
+                            if prev_bid > 0 and bid_vol < prev_bid * 0.5:
+                                self._log_skip(sym, "no_bid_absorption", feat, "")
+                                self.last_liq_state[sym] = {
+                                    "bid_vol": bid_vol,
+                                    "ask_vol": ask_vol,
+                                    "mid": mid,
+                                    "ts": now_ts,
+                                }
+                                continue
+                        else:  # side == "sell"
+                            if prev_bid > 0 and bid_vol > prev_bid * 1.6:
+                                self._log_skip(sym, "spoof_bid_wall", feat, "")
+                                self.last_liq_state[sym] = {
+                                    "bid_vol": bid_vol,
+                                    "ask_vol": ask_vol,
+                                    "mid": mid,
+                                    "ts": now_ts,
+                                }
+                                continue
+                            # lack of ask absorption (iceberg vanished)
+                            if prev_ask > 0 and ask_vol < prev_ask * 0.5:
+                                self._log_skip(sym, "no_ask_absorption", feat, "")
+                                self.last_liq_state[sym] = {
+                                    "bid_vol": bid_vol,
+                                    "ask_vol": ask_vol,
+                                    "mid": mid,
+                                    "ts": now_ts,
+                                }
+                                continue
+
+            # update footprint memory
+            self.last_liq_state[sym] = {
+                "bid_vol": bid_vol,
+                "ask_vol": ask_vol,
+                "mid": mid,
+                "ts": now_ts,
+            }
+
+            # -------- LV filter --------
             if side == "buy":
                 if bid_vol <= 0:
                     self._log_skip(sym, "lv_no_bid_liq", feat, "")
@@ -982,14 +1148,24 @@ class ScalperBot:
             return
         self.mkt.last_signal_ts[best_sym] = now
 
-        await self.open_position(best_sym, best_feat, best_side)
+        # set pending entry for confirmation instead of entering instantly
+        self.pending_entry = {
+            "symbol": best_sym,
+            "feat": best_feat,
+            "side": best_side,
+            "ts": now,
+        }
+        print(
+            f"[SIGNAL] {best_sym} {best_side.upper()} score={best_score:.3f} "
+            f"waiting {CONFIRMATION_DELAY:.2f}s confirmation"
+        )
 
     # -------------------------------------------------
     # order execution
     # -------------------------------------------------
     async def open_position(self, sym_ws: str, feat: dict, side: str):
         """
-        Open a new position with FIXED TP, STATIC SL and dynamic ladder SL.
+        Open a new position with ADAPTIVE TP, STATIC SL and dynamic ladder SL.
         """
         try:
             equity = await self.exchange.fetch_equity()
@@ -1015,6 +1191,13 @@ class ScalperBot:
         if qty <= 0:
             return
 
+        # determine adaptive TP based on micro range (volatility)
+        rng = feat.get("range_pct", 0.0)
+        if rng < 0.0045:         # <0.45% micro range
+            tp_pct = 0.0040      # target ~0.40%
+        else:
+            tp_pct = 0.0060      # target ~0.60%
+
         # ENTRY: market order
         try:
             order = await self.exchange.create_market_order(
@@ -1030,10 +1213,10 @@ class ScalperBot:
 
         # recompute TP / SL from actual entry
         if side == "buy":
-            tp_price = entry_price * (1.0 + TP_PCT)
+            tp_price = entry_price * (1.0 + tp_pct)
             sl_price = entry_price * (1.0 - SL_PCT)
         else:
-            tp_price = entry_price * (1.0 - TP_PCT)
+            tp_price = entry_price * (1.0 - tp_pct)
             sl_price = entry_price * (1.0 + SL_PCT)
 
         # TP as limit reduce-only maker
@@ -1063,11 +1246,11 @@ class ScalperBot:
         self.last_trade_time = time.time()
         print(
             f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL={sl_price:.4f}"
+            f"TP={tp_price:.4f} SL={sl_price:.4f} (tp_pct={tp_pct*100:.2f}%)"
         )
         await send_telegram(
             f"📌 ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} "
-            f"TP={tp_price:.4f} SL={sl_price:.4f} (ladder enabled)"
+            f"TP={tp_price:.4f} SL={sl_price:.4f} (tp={tp_pct*100:.2f}%, ladder enabled)"
         )
 
     # -------------------------------------------------
@@ -1078,6 +1261,12 @@ class ScalperBot:
         - Detect if exchange closed position (TP hit or SL hit)
         - If still open, apply ladder dynamic SL + backup SL check
         """
+        now = time.time()
+        # throttle watchdog to ~0.5s
+        if now - self.last_watchdog_ts < 0.5:
+            return
+        self.last_watchdog_ts = now
+
         if not self.position:
             return
 
@@ -1092,6 +1281,7 @@ class ScalperBot:
             # Recompute last move for reason calculation
             feat = self.mkt.compute_features(sym)
             reason = "unknown"
+            was_loss = True
 
             if feat:
                 mid = feat["mid"]
@@ -1103,8 +1293,10 @@ class ScalperBot:
                 # Profit or loss detection
                 if move > 0:
                     reason = "TP filled (profit/ladder)"
+                    was_loss = False
                 else:
                     reason = "SL filled (loss/ladder)"
+                    was_loss = True
 
             # -------- LOG & TELEGRAM --------
             print(
@@ -1115,6 +1307,10 @@ class ScalperBot:
                 f"📤 EXIT — {sym} {pos.side.upper()} entry={pos.entry_price:.4f}\n"
                 f"➡️ {reason}"
             )
+
+            # set exit cooldown
+            self.last_exit_ts = time.time()
+            self.last_exit_was_loss = was_loss
 
             # CLEAR POSITION
             self.position = None
@@ -1210,6 +1406,10 @@ class ScalperBot:
                 f"🛑 BACKUP SL — {sym} {pos.side.upper()}\n"
                 f"Entry={pos.entry_price:.4f}  SL={pos.sl_price:.4f}"
             )
+
+            # set exit cooldown as loss
+            self.last_exit_ts = time.time()
+            self.last_exit_was_loss = True
 
             self.position = None
             return
@@ -1407,8 +1607,9 @@ async def main():
         while True:
             await bot.maybe_kill_switch()
             await bot.eval_symbols_and_maybe_enter()
+            # watchdog is self-throttled to ~0.5s
             await bot.watchdog_position()
-            await asyncio.sleep(1.0)  # 1-second scan loop
+            await asyncio.sleep(0.25)  # main scan loop at 0.25s
     finally:
         ws_task.cancel()
         try:
