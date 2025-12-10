@@ -1194,9 +1194,9 @@ class ScalperBot:
         # determine adaptive TP based on micro range (volatility)
         rng = feat.get("range_pct", 0.0)
         if rng < 0.0045:         # <0.45% micro range
-            tp_pct = 0.0040      # target ~0.40%
+            tp_pct = 0.0010      # target ~0.10%
         else:
-            tp_pct = 0.0060      # target ~0.60%
+            tp_pct = 0.0010      # target ~0.10%
 
         # ENTRY: market order
         try:
