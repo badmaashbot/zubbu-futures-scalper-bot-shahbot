@@ -102,6 +102,7 @@ WICK_MIN_RATIO = 0.40      # wick >= 40% of body
 CONFIRMATION_DELAY = 0.35  # seconds to re-check before entry
 MICROFLOW_WINDOW = 0.35    # seconds for microflow fade check
 VOLATILITY_THRESHOLD = 0.006  # 0.6% 1-minute range skip (optional guard)
+BTC_VOL_GUARD_PCT = 0.004     # 0.40% BTC 1m spike triggers guard
 
 # --------------- TELEGRAM -----------------
 
