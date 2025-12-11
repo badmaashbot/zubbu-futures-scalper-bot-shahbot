@@ -1,819 +1,531 @@
 #!/usr/bin/env python3
 """
-ZUBBU_REVERSAL_V1 – Reversal bot tuned for real trading (TP 0.40% / SL 0.25%)
-
-Key:
- - Symbols: BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT (DOGE removed)
- - TP = 0.40% (tp_pct = 0.0040)
- - SL = 0.25% (sl_pct = 0.0025)
- - Minimum expected move required = 0.40% (to overcome fees & delay)
- - Confirmation buffer = 0.35s
- - SAFE guards (BTC spike, BB width, symbol micro-range)
+ZUBBU_REVERSAL_V4_BALANCED_A
+Reversal Bot – Balanced Mode:
+- Bollinger Band Extremes
+- RSI Curl Confirmation
+- Band-Walk Protection
+- Volatility Spike Guard
+- Wick-Strength Filter
+- Orderflow Slowdown Check
+- 0.35s Confirmation Delay
+- TP = 0.25% , SL = 0.18%
+- Balanced Reversal Mode (10–18 trades/day)
 """
 
-import os
-import time
-import json
-import math
-import asyncio
-import threading
+import os, time, json, math, asyncio, aiohttp
+import numpy as np
 from collections import deque
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import aiohttp
 import ccxt
 
-# ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_REVERSAL_V1"
+# ---------------- CONFIG -----------------
+API_KEY     = os.getenv("BYBIT_API_KEY")
+API_SECRET  = os.getenv("BYBIT_API_SECRET")
+TESTNET     = os.getenv("BYBIT_TESTNET","0") in ("1","true","True")
 
-# ---------------- ENV / BASIC CONFIG ----------------
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-TESTNET = os.getenv("BYBIT_TESTNET", "0") in ("1", "true", "True")
-
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-if not API_KEY or not API_SECRET:
-    raise RuntimeError("Missing BYBIT_API_KEY or BYBIT_API_SECRET env vars.")
-
-# Trade these liquid pairs only
-SYMBOLS_WS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-
-# ccxt mapping
-SYMBOL_MAP = {
-    "BTCUSDT": "BTC/USDT:USDT",
-    "ETHUSDT": "ETH/USDT:USDT",
-    "BNBUSDT": "BNB/USDT:USDT",
-    "SOLUSDT": "SOL/USDT:USDT",
+SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","DOGEUSDT"]
+MAP = {
+    "BTCUSDT":"BTC/USDT:USDT",
+    "ETHUSDT":"ETH/USDT:USDT",
+    "SOLUSDT":"SOL/USDT:USDT",
+    "BNBUSDT":"BNB/USDT:USDT",
+    "DOGEUSDT":"DOGE/USDT:USDT",
 }
 
-# WS url
-if TESTNET:
-    WS_URL = "wss://stream-testnet.bybit.com/v5/public/linear"
-else:
-    WS_URL = "wss://stream.bybit.com/v5/public/linear"
+WS_URL = (
+    "wss://stream-testnet.bybit.com/v5/public/linear"
+    if TESTNET else
+    "wss://stream.bybit.com/v5/public/linear"
+)
 
-# --------------- TRADING CONFIG -----------------
+TP_PCT = 0.0025     # 0.25%
+SL_PCT = 0.0018     # 0.18%
+CONFIRM_DELAY = 0.35
+COOLDOWN = 12
 LEVERAGE = 5
-EQUITY_USE_FRACTION = 0.97
+USE_EQUITY = 0.97
 
-# TP / SL tuned to overcome fees + delay
-TP_PCT = 0.0040   # 0.40% take profit
-SL_PCT = 0.0025   # 0.25% stop loss
+BB_PERIOD = 20
+BB_STD    = 2.0
+RSI_PERIOD = 14
 
-# Orderflow / burst thresholds (reversal-oriented)
-SCORE_MIN        = 0.60
-IMBALANCE_THRESH = 0.05
-BURST_MICRO_MIN  = 0.020
-BURST_ACCUM_MIN  = 0.050
-MAX_SPREAD       = 0.0015
-MIN_RANGE_PCT    = 0.00020
+VOLATILITY_THRESHOLD = 0.0035    # 0.35% 1m guard
+WICK_MIN_RATIO = 0.40           # wick must be at least 40% candle
 
-# Market timing
-RECENT_TRADE_WINDOW = 0.35
-ACCUM_BURST_WINDOW  = 5.0
-BOOK_STALE_SEC      = 6.0
+# -----------------------------------------
+# INDICATORS
+# -----------------------------------------
+def rsi(values, period=14):
+    if len(values) < period + 2:
+        return None
+    diff = np.diff(values)
+    up = diff.clip(min=0)
+    dn = -diff.clip(max=0)
+    avg_up = np.mean(up[-period:])
+    avg_dn = np.mean(dn[-period:])
+    if avg_dn == 0:
+        return 100
+    rs = avg_up / avg_dn
+    return 100 - (100/(1+rs))
 
-# Logging cooldown
-LAST_SKIP_LOG: Dict[str, float] = {}
-SKIP_LOG_COOLDOWN = 5.0
+def bollinger(values, period=20, std=2.0):
+    if len(values) < period:
+        return None
+    arr = np.array(values[-period:])
+    mid = np.mean(arr)
+    dev = np.std(arr)
+    return mid + std*dev, mid, mid - std*dev
 
-# Risk & heartbeat
-KILL_SWITCH_DD      = 0.05
-HEARTBEAT_IDLE_SEC  = 1800
-
-MIN_QTY_MAP = {
-    "BTCUSDT": 0.001,
-    "ETHUSDT": 0.01,
-    "BNBUSDT": 0.01,
-    "SOLUSDT": 0.1,
-}
-
-# Reversal & safety
-EXPECTED_MOVE_MIN = 0.0040   # require ~0.40% available move
-CONFIRMATION_DELAY = 0.35    # seconds
-COOLDOWN_SL = 30.0
-COOLDOWN_TP = 12.0
-
-BTC_VOL_SPIKE_PCT   = 0.005   # 0.50% BTC 1m move -> cooldown
-BTC_VOL_COOLDOWN    = 10.0
-SYMBOL_RANGE_MAX_SAFE = 0.008
-BB_WIDTH_MAX_SAFE     = 0.012
-
-VEL_MIN_TRADES   = 6
-
-# Telegram rate-limit
-_last_tg_ts = 0.0
-TG_MIN_INTERVAL = 30.0
-
-
-async def send_telegram(msg: str):
-    global _last_tg_ts
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    now = time.time()
-    if now - _last_tg_ts < TG_MIN_INTERVAL:
-        return
-    _last_tg_ts = now
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0)) as session:
-            await session.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                data={"chat_id": TG_CHAT_ID, "text": msg},
-            )
-    except Exception:
-        pass
-
-
-def safe_float(x, default: Optional[float] = None) -> Optional[float]:
-    if x is None:
-        return default
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return default
-
-
-def mean(values: List[float]) -> float:
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
-
-
-def stddev(values: List[float]) -> float:
-    n = len(values)
-    if n < 2:
-        return 0.0
-    m = mean(values)
-    var = sum((v - m) ** 2 for v in values) / (n - 1)
-    return math.sqrt(max(var, 0.0))
-
-
-class ExchangeClient:
+# -----------------------------------------
+# EXCHANGE WRAPPER
+# -----------------------------------------
+class EX:
     def __init__(self):
         cfg = {
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"},
+            "apiKey":API_KEY,
+            "secret":API_SECRET,
+            "enableRateLimit":True,
+            "options":{"defaultType":"swap"},
         }
         if TESTNET:
-            cfg["urls"] = {"api": {"public": "https://api-testnet.bybit.com", "private": "https://api-testnet.bybit.com"}}
-        self.client = ccxt.bybit(cfg)
+            cfg["urls"]={"api":{
+                "public":"https://api-testnet.bybit.com",
+                "private":"https://api-testnet.bybit.com"
+            }}
+        self.c = ccxt.bybit(cfg)
 
-    async def set_leverage(self, sym_ws: str, lev: int) -> None:
-        symbol = SYMBOL_MAP[sym_ws]
-        def _work():
+    async def leverage(self, s):
+        def w():
+            try: self.c.set_leverage(LEVERAGE, MAP[s], params={"category":"linear"})
+            except: pass
+        return await asyncio.to_thread(w)
+
+    async def equity(self):
+        def w():
+            bal = self.c.fetch_balance()
+            return float(bal["USDT"]["total"])
+        return await asyncio.to_thread(w)
+
+    async def pos_size(self, s):
+        def w():
             try:
-                self.client.set_leverage(lev, symbol, params={"category": "linear"})
-            except Exception:
-                pass
-        await asyncio.to_thread(_work)
+                ps = self.c.fetch_positions([MAP[s]])
+                for p in ps:
+                    return abs(float(p.get("contracts",0)))
+            except:
+                return 0
+            return 0
+        return await asyncio.to_thread(w)
 
-    async def fetch_equity(self) -> float:
-        def _work():
-            bal = self.client.fetch_balance()
-            total = safe_float(bal.get("USDT", {}).get("total"), 0.0) or 0.0
-            upnl = 0.0
+    async def market(self, s, side, qty):
+        def w():
+            return self.c.create_order(
+                MAP[s], "market", side, qty, None, {"category":"linear"}
+            )
+        return await asyncio.to_thread(w)
+
+    async def close_all(self, s):
+        def w():
             try:
-                positions = self.client.fetch_positions()
-                for p in positions:
-                    upnl += safe_float(p.get("unrealizedPnl"), 0.0) or 0.0
-            except Exception:
-                pass
-            return total + upnl
-        return await asyncio.to_thread(_work)
+                ps = self.c.fetch_positions([MAP[s]])
+                for p in ps:
+                    qty = abs(float(p.get("contracts",0)))
+                    if qty > 0:
+                        sd = "sell" if p["side"]=="long" else "buy"
+                        self.c.create_order(
+                            MAP[s],"market",sd,qty,None,{"reduceOnly":True}
+                        )
+            except: pass
+        return await asyncio.to_thread(w)
 
-    async def get_position_size(self, sym_ws: str) -> float:
-        symbol = SYMBOL_MAP[sym_ws]
-        def _work():
-            try:
-                pos = self.client.fetch_positions([symbol])
-                for p in pos:
-                    contracts = safe_float(p.get("contracts"), 0.0) or 0.0
-                    return contracts
-            except Exception:
-                return 0.0
-            return 0.0
-        return await asyncio.to_thread(_work)
-
-    async def close_position_market(self, sym_ws: str):
-        symbol = SYMBOL_MAP[sym_ws]
-        def _work():
-            try:
-                positions = self.client.fetch_positions([symbol])
-            except Exception:
-                return
-            for p in positions:
-                contracts = safe_float(p.get("contracts"), 0.0) or 0.0
-                if contracts == 0:
-                    continue
-                side = "sell" if p.get("side") == "long" else "buy"
-                params = {"category": "linear", "reduceOnly": True}
-                try:
-                    self.client.create_order(symbol, "market", side, abs(contracts), None, params)
-                except Exception:
-                    pass
-        await asyncio.to_thread(_work)
-
-    async def create_market_order(self, sym_ws: str, side: str, qty: float, reduce_only: bool = False):
-        symbol = SYMBOL_MAP[sym_ws]
-        side = side.lower()
-        params = {"category": "linear"}
-        if reduce_only:
-            params["reduceOnly"] = True
-        def _work():
-            return self.client.create_order(symbol, "market", side, qty, None, params)
-        return await asyncio.to_thread(_work)
-
-    async def create_limit_order(self, sym_ws: str, side: str, qty: float, price: float, reduce_only: bool = False, post_only: bool = False):
-        symbol = SYMBOL_MAP[sym_ws]
-        side = side.lower()
-        params = {"category": "linear", "timeInForce": "GTC"}
-        if reduce_only:
-            params["reduceOnly"] = True
-        if post_only:
-            params["timeInForce"] = "PostOnly"
-        def _work():
-            return self.client.create_order(symbol, "limit", side, qty, price, params)
-        return await asyncio.to_thread(_work)
-
-
-@dataclass
-class Position:
-    symbol_ws: str
-    side: str
-    qty: float
-    entry_price: float
-    tp_price: float
-    sl_price: float
-    opened_ts: float
-
-
-class MarketState:
+# -----------------------------------------
+# STATE
+# -----------------------------------------
+class State:
     def __init__(self):
-        self.books: Dict[str, dict] = {s: {"bids": {}, "asks": {}, "ts": 0.0} for s in SYMBOLS_WS}
-        self.trades: Dict[str, deque] = {s: deque(maxlen=2000) for s in SYMBOLS_WS}
-        self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
+        self.prices = {s:deque(maxlen=500) for s in SYMBOLS}
+        self.trades = {s:deque(maxlen=2000) for s in SYMBOLS}
+        self.candles = {s:deque(maxlen=120) for s in SYMBOLS}  # 2 minutes buffer
 
-    def update_book(self, symbol: str, data: dict):
-        book = self.books[symbol]
-        if isinstance(data, dict) and ("b" in data or "a" in data):
-            ts_raw = data.get("ts") or data.get("t") or (time.time() * 1000)
-            book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
-            if "b" in data and "a" in data:
-                book["bids"].clear(); book["asks"].clear()
-                for px, qty in data.get("b", []):
-                    p = safe_float(px); q = safe_float(qty)
-                    if p and q: book["bids"][p] = q
-                for px, qty in data.get("a", []):
-                    p = safe_float(px); q = safe_float(qty)
-                    if p and q: book["asks"][p] = q
-                return
-            if "b" in data:
-                for px, qty in data["b"]:
-                    p = safe_float(px); q = safe_float(qty)
-                    if not p: continue
-                    if q == 0: book["bids"].pop(p, None)
-                    else: book["bids"][p] = q
-            if "a" in data:
-                for px, qty in data["a"]:
-                    p = safe_float(px); q = safe_float(qty)
-                    if not p: continue
-                    if q == 0: book["asks"].pop(p, None)
-                    else: book["asks"][p] = q
-            return
-        ts_raw = data.get("ts")
-        book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
-        typ = data.get("type")
-        if typ == "snapshot":
-            book["bids"].clear(); book["asks"].clear()
-            for px, qty in data.get("bids", []):
-                p = safe_float(px); q = safe_float(qty)
-                if p and q: book["bids"][p] = q
-            for px, qty in data.get("asks", []):
-                p = safe_float(px); q = safe_float(qty)
-                if p and q: book["asks"][p] = q
-            return
-        for key in ("delete", "update", "insert"):
-            part = data.get(key, {})
-            for px, qty in part.get("bids", []):
-                p = safe_float(px); q = safe_float(qty)
-                if p:
-                    if q == 0: book["bids"].pop(p, None)
-                    else: book["bids"][p] = q
-            for px, qty in part.get("asks", []):
-                p = safe_float(px); q = safe_float(qty)
-                if p:
-                    if q == 0: book["asks"].pop(p, None)
-                    else: book["asks"][p] = q
+st = State()
+ex = EX()
 
-    def add_trade(self, symbol: str, trade: dict):
-        self.trades[symbol].append(trade)
+position = None
+pending = None
+cooldown_until = 0
 
-    def get_best_bid_ask(self, symbol: str) -> Optional[Tuple[float, float]]:
-        book = self.books[symbol]
-        if not book["bids"] or not book["asks"]:
-            return None
-        best_bid = max(book["bids"].keys())
-        best_ask = min(book["asks"].keys())
-        return best_bid, best_ask
-
-    def compute_features(self, symbol: str) -> Optional[dict]:
-        book = self.books[symbol]
-        if not book["bids"] or not book["asks"]:
-            return None
-        now = time.time()
-        if now - book["ts"] > BOOK_STALE_SEC:
-            return None
-        bids_sorted = sorted(book["bids"].items(), key=lambda x: -x[0])[:5]
-        asks_sorted = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
-        bid_vol = sum(q for _, q in bids_sorted)
-        ask_vol = sum(q for _, q in asks_sorted)
-        if bid_vol + ask_vol == 0:
-            return None
-        imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        best_bid = bids_sorted[0][0]
-        best_ask = asks_sorted[0][0]
-        mid = (best_bid + best_ask) / 2.0
-        if mid <= 0:
-            return None
-        spread = (best_ask - best_bid) / mid
-        cutoff_micro = now - RECENT_TRADE_WINDOW
-        cutoff_accum = now - ACCUM_BURST_WINDOW
-        micro_burst = 0.0
-        accum_burst = 0.0
-        recent_prices: List[float] = []
-        recent_trades: List[Tuple[float, float]] = []
-        for t in reversed(self.trades[symbol]):
-            ts = t["ts"]
-            if ts < cutoff_accum:
-                break
-            side_mult = 1.0 if t["side"] == "buy" else -1.0
-            sz = t["size"]
-            accum_burst += side_mult * sz
-            if ts >= cutoff_micro:
-                micro_burst += side_mult * sz
-            price = t["price"]
-            recent_prices.append(price)
-            recent_trades.append((ts, side_mult * sz))
-        if not recent_prices:
-            return None
-        high = max(recent_prices)
-        low = min(recent_prices)
-        rng = (high - low) / mid if mid > 0 else 0.0
-        trade_count = len(recent_trades)
-        return {
-            "mid": mid,
-            "spread": spread,
-            "imbalance": imbalance,
-            "burst": accum_burst,
-            "burst_micro": micro_burst,
-            "range_pct": rng,
-            "trade_count": trade_count,
-        }
-
-
-def compute_momentum_score(imbalance: float, burst: float, spread: float) -> float:
-    if spread <= 0:
-        spread = 1e-6
-    return abs(imbalance) * abs(burst) / spread
-
-
-class ScalperBot:
-    def __init__(self, exchange: ExchangeClient, mkt: MarketState):
-        self.exchange = exchange
-        self.mkt = mkt
-        self.position: Optional[Position] = None
-        self.start_equity: Optional[float] = None
-        self.last_trade_time: float = 0.0
-        self.last_heartbeat_ts: float = 0.0
-        self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
-        self.last_btc_vol_spike_ts: float = 0.0
-        self.last_skip_log = LAST_SKIP_LOG
-        self.pending_entry: Optional[dict] = None
-        self.last_exit_ts: float = 0.0
-        self.last_exit_was_loss: bool = False
-        self.last_watchdog_ts: float = 0.0
-
-    def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
-        buf1 = self.price_1m[sym]
-        buf1.append((now, mid))
-        cutoff1 = now - 60.0
-        while buf1 and buf1[0][0] < cutoff1:
-            buf1.popleft()
-
-    def _get_1m_context(self, sym: str) -> Optional[dict]:
-        buf = self.price_1m[sym]
-        if len(buf) < 5:
-            return None
-        prices = [p for _, p in buf]
-        high = max(prices)
-        low = min(prices)
-        rng = high - low
-        if rng <= 0:
-            return None
-        last_price = prices[-1]
-        pos_in_range = (last_price - low) / rng
-        return {"high": high, "low": low, "range": rng, "pos": pos_in_range, "near_support": pos_in_range <= 0.2, "near_resistance": pos_in_range >= 0.8}
-
-    def _get_1m_bb(self, sym: str) -> Optional[dict]:
-        buf = self.price_1m[sym]
-        if len(buf) < 20:
-            return None
-        prices = [p for _, p in buf]
-        closes = prices[-20:]
-        m = mean(closes)
-        sd = stddev(closes)
-        if m <= 0 or sd <= 0:
-            return None
-        upper = m + 3.0 * sd
-        lower = m - 3.0 * sd
-        width_pct = (upper - lower) / m if m > 0 else 0.0
-        return {"mid": m, "upper": upper, "lower": lower, "width_pct": width_pct}
-
-    def _log_skip(self, sym: str, reason: str, feat: dict, extra: str = "") -> None:
-        now = time.time()
-        key = f"{sym}:{reason}"
-        last = self.last_skip_log.get(key, 0.0)
-        if now - last < SKIP_LOG_COOLDOWN:
-            return
-        self.last_skip_log[key] = now
-        mid = feat.get("mid", 0.0)
-        spread = feat.get("spread", 0.0)
-        imb = feat.get("imbalance", 0.0)
-        burst = feat.get("burst", 0.0)
-        b_micro = feat.get("burst_micro", 0.0)
-        rng = feat.get("range_pct", 0.0)
-        tcount = feat.get("trade_count", 0)
-        msg = (f"[SKIP] {sym} {reason} {extra} | mid={mid:.4f} spread={spread:.6f} imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} trades={tcount} rng={rng:.6f}")
-        print(msg, flush=True)
-
-    async def init_equity_and_leverage(self):
-        eq = await self.exchange.fetch_equity()
-        self.start_equity = eq
-        print(f"[INIT] Equity: {eq:.2f} USDT — {BOT_VERSION}", flush=True)
-        await send_telegram(f"🟢 Bot started ({BOT_VERSION}). Equity: {eq:.2f} USDT.")
-        for s in SYMBOLS_WS:
-            await self.exchange.set_leverage(s, LEVERAGE)
-        print("[INIT] Leverage set for all symbols.", flush=True)
-
-    async def maybe_kill_switch(self):
-        if self.start_equity is None:
-            return
-        eq = await self.exchange.fetch_equity()
-        if self.start_equity <= 0:
-            return
-        dd = (self.start_equity - eq) / self.start_equity
-        if dd >= KILL_SWITCH_DD:
-            if self.position:
-                await self.exchange.close_position_market(self.position.symbol_ws)
-                await send_telegram(f"🚨 Kill-switch: equity drawdown {dd*100:.2f}%. Position closed.")
-                self.position = None
-            raise SystemExit("Kill-switch triggered")
-
-    def _safe_mode_block_entries(self, now: float) -> bool:
-        if now - self.last_btc_vol_spike_ts < BTC_VOL_COOLDOWN:
-            return True
-        buf = self.price_1m.get("BTCUSDT")
-        if buf and len(buf) >= 2:
-            p0 = buf[0][1]; p1 = buf[-1][1]
-            if p0 > 0:
-                chg = abs(p1 - p0) / p0
-                if chg > BTC_VOL_SPIKE_PCT:
-                    self.last_btc_vol_spike_ts = now
-                    print(f"[SAFE] BTC 1m move={chg:.4f} > {BTC_VOL_SPIKE_PCT:.4f} -> cooldown.", flush=True)
-                    return True
-        return False
-
-    async def eval_symbols_and_maybe_enter(self):
-        if self.position is not None:
-            return
-        now = time.time()
-        if self.last_exit_ts > 0.0:
-            cooldown = COOLDOWN_SL if self.last_exit_was_loss else COOLDOWN_TP
-            if now - self.last_exit_ts < cooldown:
-                return
-        if self._safe_mode_block_entries(now):
-            return
-
-        if self.pending_entry:
-            pe = self.pending_entry
-            if now - pe["ts"] >= CONFIRMATION_DELAY:
-                sym = pe["symbol"]; side = pe["side"]
-                feat_new = self.mkt.compute_features(sym)
-                if not feat_new:
-                    self.pending_entry = None
-                else:
-                    ctx_1m = self._get_1m_context(sym); bb = self._get_1m_bb(sym)
-                    expected_move = self._estimate_expected_move(sym, feat_new, ctx_1m, bb, side)
-                    if expected_move < EXPECTED_MOVE_MIN:
-                        self._log_skip(sym, "confirm_expected_move", feat_new, f"{expected_move:.4f} < {EXPECTED_MOVE_MIN:.4f}")
-                        self.pending_entry = None
-                    elif not self._symbol_safe(sym, feat_new, ctx_1m, bb):
-                        self._log_skip(sym, "confirm_vol_guard", feat_new, "")
-                        self.pending_entry = None
-                    elif not self._reversal_flow_ok(feat_new, side):
-                        self._log_skip(sym, "confirm_dir", feat_new, "reversal flow broke")
-                        self.pending_entry = None
-                    else:
-                        await self.open_position(sym, feat_new, side)
-                        self.pending_entry = None
-                        return
-            if self.pending_entry:
-                return
-
-        best_score = 0.0
-        best_sym: Optional[str] = None
-        best_feat: Optional[dict] = None
-        best_side: Optional[str] = None
-
-        for sym in SYMBOLS_WS:
-            feat = self.mkt.compute_features(sym)
-            if not feat:
-                continue
-            mid = feat["mid"]
-            self._update_price_buffers(sym, mid, now)
-            ctx_1m = self._get_1m_context(sym)
-            bb = self._get_1m_bb(sym)
-            if not self._symbol_safe(sym, feat, ctx_1m, bb):
-                continue
-            rng = feat["range_pct"]; spread = feat["spread"]
-            if spread <= 0 or spread > MAX_SPREAD:
-                self._log_skip(sym, "spread", feat, f"> MAX_SPREAD({MAX_SPREAD})"); continue
-            if rng < MIN_RANGE_PCT:
-                self._log_skip(sym, "range", feat, f"< MIN_RANGE_PCT({MIN_RANGE_PCT})"); continue
-            if not ctx_1m:
-                self._log_skip(sym, "ctx_1m_missing", feat, ""); continue
-            pos = ctx_1m["pos"]
-            if pos <= 0.25:
-                side = "buy"
-            elif pos >= 0.75:
-                side = "sell"
-            else:
-                self._log_skip(sym, "mid_range", feat, f"pos={pos:.2f}"); continue
-            if not self._reversal_flow_ok(feat, side):
-                self._log_skip(sym, "reversal_flow", feat, f"side={side}"); continue
-            if feat["trade_count"] < VEL_MIN_TRADES:
-                self._log_skip(sym, "velocity", feat, f"trades={feat['trade_count']} < {VEL_MIN_TRADES}"); continue
-            expected_move = self._estimate_expected_move(sym, feat, ctx_1m, bb, side)
-            if expected_move < EXPECTED_MOVE_MIN:
-                self._log_skip(sym, "expected_move", feat, f"{expected_move:.4f} < {EXPECTED_MOVE_MIN:.4f}"); continue
-            score = compute_momentum_score(feat["imbalance"], feat["burst"], feat["spread"])
-            if score < SCORE_MIN:
-                self._log_skip(sym, "score", feat, f"{score:.3f} < {SCORE_MIN}"); continue
-            if score > best_score:
-                best_score = score; best_sym = sym; best_feat = feat; best_side = side
-
-        if not best_sym or not best_feat or not best_side:
-            return
-        if now - self.mkt.last_signal_ts[best_sym] < 0.5:
-            return
-        self.mkt.last_signal_ts[best_sym] = now
-        self.pending_entry = {"symbol": best_sym, "side": best_side, "ts": now}
-        print(f"[SIGNAL] {best_sym} {best_side.upper()} score={best_score:.3f} waiting {CONFIRMATION_DELAY:.2f}s confirmation", flush=True)
-
-    def _symbol_safe(self, sym: str, feat: dict, ctx_1m: Optional[dict], bb: Optional[dict]) -> bool:
-        rng = feat.get("range_pct", 0.0)
-        if rng > SYMBOL_RANGE_MAX_SAFE:
-            self._log_skip(sym, "sym_range_unsafe", feat, f"rng={rng:.4f} > {SYMBOL_RANGE_MAX_SAFE:.4f}")
-            return False
-        if bb:
-            w = bb.get("width_pct", 0.0)
-            if w > BB_WIDTH_MAX_SAFE:
-                self._log_skip(sym, "bb_width_unsafe", feat, f"bb_width={w:.4f} > {BB_WIDTH_MAX_SAFE:.4f}")
-                return False
-        if ctx_1m and ctx_1m["range"] <= 0:
-            self._log_skip(sym, "ctx_1m_zero_range", feat, ""); return False
-        return True
-
-    def _reversal_flow_ok(self, feat: dict, side: str) -> bool:
-        imb = feat["imbalance"]; burst = feat["burst"]; b_micro = feat["burst_micro"]
-        if abs(imb) < IMBALANCE_THRESH: return False
-        if abs(burst) < BURST_ACCUM_MIN: return False
-        if abs(b_micro) < BURST_MICRO_MIN: return False
-        if side == "buy": return imb > 0 and burst > 0 and b_micro > 0
-        else: return imb < 0 and burst < 0 and b_micro < 0
-
-    def _estimate_expected_move(self, sym: str, feat: dict, ctx_1m: Optional[dict], bb: Optional[dict], side: str) -> float:
-        mid = feat["mid"]
-        if mid <= 0: return 0.0
-        estimates: List[float] = []
-        if ctx_1m:
-            high = ctx_1m["high"]; low = ctx_1m["low"]
-            mid_price = (high + low) / 2.0
-            if side == "buy":
-                if mid_price > mid: estimates.append((mid_price - mid) / mid)
-                if high > mid: estimates.append((high - mid) / mid)
-            else:
-                if mid_price < mid: estimates.append((mid - mid_price) / mid)
-                if low < mid: estimates.append((mid - low) / mid)
-        if bb:
-            bb_mid = bb["mid"]; upper = bb["upper"]; lower = bb["lower"]
-            if side == "buy":
-                if bb_mid > mid: estimates.append((bb_mid - mid) / mid)
-                if upper > mid: estimates.append((upper - mid) / mid)
-            else:
-                if bb_mid < mid: estimates.append((mid - bb_mid) / mid)
-                if lower < mid: estimates.append((mid - lower) / mid)
-        if not estimates: return 0.0
-        expected = max(estimates)
-        return max(expected, 0.0)
-
-    async def open_position(self, sym_ws: str, feat: dict, side: str):
-        try:
-            equity = await self.exchange.fetch_equity()
-        except Exception:
-            return
-        if equity <= 0:
-            return
-        mid = feat["mid"]
-        notional = equity * EQUITY_USE_FRACTION * LEVERAGE
-        if mid <= 0:
-            return
-        qty = notional / mid
-        min_qty = MIN_QTY_MAP.get(sym_ws, 0.0)
-        if qty < min_qty:
-            print(f"[SKIP ENTRY] {sym_ws} qty {qty:.6f} < min {min_qty}", flush=True); return
-        qty = math.floor(qty * 1000) / 1000.0
-        if qty <= 0: return
-        try:
-            order = await self.exchange.create_market_order(sym_ws, side, qty, reduce_only=False)
-            entry_price = safe_float(order.get("average") or order.get("price"), mid) or mid
-        except Exception as e:
-            print(f"[ENTRY ERROR] {sym_ws}: {e}", flush=True)
-            await send_telegram(f"❌ Entry failed for {sym_ws}")
-            return
-        if side == "buy":
-            tp_price = entry_price * (1.0 + TP_PCT)
-            sl_price = entry_price * (1.0 - SL_PCT)
-        else:
-            tp_price = entry_price * (1.0 - TP_PCT)
-            sl_price = entry_price * (1.0 + SL_PCT)
-        opp_side = "sell" if side == "buy" else "buy"
-        try:
-            await self.exchange.create_limit_order(sym_ws, opp_side, qty, tp_price, reduce_only=True, post_only=True)
-        except Exception as e:
-            print(f"[TP ERROR] {sym_ws}: {e}", flush=True)
-            await send_telegram(f"⚠️ TP order placement failed for {sym_ws}")
-        self.position = Position(symbol_ws=sym_ws, side=side, qty=qty, entry_price=entry_price, tp_price=tp_price, sl_price=sl_price, opened_ts=time.time())
-        self.last_trade_time = time.time()
-        print(f"[ENTRY] {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} TP={tp_price:.4f} SL={sl_price:.4f}", flush=True)
-        await send_telegram(f"📌 REVERSAL ENTRY {sym_ws} {side.upper()} qty={qty} entry={entry_price:.4f} TP={tp_price:.4f} SL={sl_price:.4f}")
-
-    async def watchdog_position(self):
-        now = time.time()
-        if now - self.last_watchdog_ts < 0.5: return
-        self.last_watchdog_ts = now
-        if not self.position: return
-        pos = self.position; sym = pos.symbol_ws
-        size = await self.exchange.get_position_size(sym)
-        if size <= 0:
-            feat = self.mkt.compute_features(sym)
-            reason = "unknown"; was_loss = True
-            if feat:
-                mid = feat["mid"]
-                if pos.side == "buy":
-                    move = (mid - pos.entry_price) / pos.entry_price
-                else:
-                    move = (pos.entry_price - mid) / pos.entry_price
-                if move > 0:
-                    reason = "TP filled (profit)"; was_loss = False
-                else:
-                    reason = "SL filled (loss)"; was_loss = True
-            print(f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}", flush=True)
-            await send_telegram(f"📤 EXIT — {sym} {pos.side.upper()} entry={pos.entry_price:.4f}\n➡️ {reason}")
-            self.last_exit_ts = time.time(); self.last_exit_was_loss = was_loss; self.position = None; return
-        feat = self.mkt.compute_features(sym)
-        if not feat: return
-        mid = feat["mid"]
-        if mid <= 0: return
-        hit = False
-        if pos.side == "buy" and mid <= pos.sl_price: hit = True
-        if pos.side == "sell" and mid >= pos.sl_price: hit = True
-        if hit:
-            await self.exchange.close_position_market(sym)
-            print(f"[BACKUP SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} SL={pos.sl_price:.4f} now={mid:.4f}", flush=True)
-            await send_telegram(f"🛑 BACKUP SL — {sym} {pos.side.upper()}\nEntry={pos.entry_price:.4f}  SL={pos.sl_price:.4f}")
-            self.last_exit_ts = time.time(); self.last_exit_was_loss = True; self.position = None
-
-    async def maybe_heartbeat(self):
-        now = time.time()
-        if now - self.last_trade_time < HEARTBEAT_IDLE_SEC: return
-        if now - self.last_heartbeat_ts < HEARTBEAT_IDLE_SEC: return
-        self.last_heartbeat_ts = now
-        eq = await self.exchange.fetch_equity()
-        print(f"[HEARTBEAT] idle, equity={eq:.2f}", flush=True)
-        await send_telegram(f"💤 Bot idle {HEARTBEAT_IDLE_SEC/60:.0f} min. Equity={eq:.2f} USDT")
-
-
-async def ws_loop(mkt: MarketState):
+# -----------------------------------------
+# WEBSOCKET LOOP
+# -----------------------------------------
+async def ws_loop():
     topics = []
-    for s in SYMBOLS_WS:
-        topics.append(f"orderbook.1.{s}")
+    for s in SYMBOLS:
         topics.append(f"publicTrade.{s}")
-    print("⚡ WS loop started... connecting...", flush=True)
+
+    print("WS Connecting…")
+
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(WS_URL, receive_timeout=40, heartbeat=20) as ws:
-                    print("📡 Connected to WS server, subscribing...", flush=True)
-                    await ws.send_json({"op": "subscribe", "args": topics})
-                    for sym in SYMBOLS_WS:
-                        pass
-                    await send_telegram("📡 WS Connected: All symbols")
+            async with aiohttp.ClientSession() as ses:
+                async with ses.ws_connect(WS_URL, heartbeat=20) as ws:
+                    await ws.send_json({"op":"subscribe","args":topics})
+                    print("WS Subscribed.")
+
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                            except Exception:
-                                continue
-                            if data.get("success") is True:
-                                continue
+                            data = json.loads(msg.data)
                             topic = data.get("topic")
-                            if not topic:
-                                continue
-                            if topic.startswith("orderbook"):
+                            if not topic: continue
+
+                            if topic.startswith("publicTrade"):
                                 sym = topic.split(".")[-1]
-                                payload = data.get("data")
-                                if not payload: continue
-                                if isinstance(payload, list): payload = payload[0]
-                                if isinstance(payload, dict): mkt.update_book(sym, payload)
-                            elif topic.startswith("publicTrade"):
-                                sym = topic.split(".")[-1]
-                                payload = data.get("data")
-                                if not payload: continue
-                                trades = payload if isinstance(payload, list) else [payload]
-                                now_ts = time.time()
-                                for t in trades:
-                                    price = safe_float(t.get("p") or t.get("price"))
-                                    qty = safe_float(t.get("v") or t.get("q") or t.get("size"))
-                                    side = (t.get("S") or t.get("side") or "Buy").lower()
-                                    if price is None or qty is None: continue
-                                    mkt.add_trade(sym, {"price": price, "size": qty, "side": "buy" if side == "buy" else "sell", "ts": now_ts})
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print("⚠ WS ERROR — reconnecting", flush=True)
-                            break
+                                arr = data.get("data",[])
+                                now = time.time()
+                                for t in arr:
+                                    px = float(t["p"])
+                                    st.prices[sym].append(px)
+                                    st.candles[sym].append(px)
+
         except Exception as e:
-            print(f"❌ WS Loop Crashed: {e}", flush=True)
+            print("WS Error:", e)
             await asyncio.sleep(1)
 
 
-def debug_console(mkt: MarketState, bot: ScalperBot):
-    help_text = ("[DEBUG] Commands:\n  ws - show websocket ready flags\n  book - show last orderbook timestamps\n  trades - show count of recent trades per symbol\n  pos - show current open position\n  help - show this message\n")
-    print(help_text, flush=True)
-    while True:
+ # -----------------------------------------
+# CORE REVERSAL LOGIC + FILTERS
+# -----------------------------------------
+def last_n_prices(sym, n=60):
+    arr = list(st.prices[sym])
+    if not arr:
+        return []
+    return arr[-n:]
+
+def minute_candle_from_buffer(sym, window_secs=60):
+    """
+    Approximate a 1-minute candle from recent price buffer.
+    Returns dict with open, high, low, close, body_size, wick_ratio.
+    """
+    prices = list(st.candles[sym])
+    if not prices:
+        return None
+    # use last up-to window_secs samples (we store frequent updates; approximate)
+    arr = prices[-int(min(len(prices), 60)):]
+    if len(arr) < 2:
+        return None
+    open_p = arr[0]
+    close_p = arr[-1]
+    high = max(arr)
+    low = min(arr)
+    body = abs(close_p - open_p)
+    upper_wick = max(0.0, high - max(open_p, close_p))
+    lower_wick = max(0.0, min(open_p, close_p) - low)
+    wick = max(upper_wick, lower_wick)
+    wick_ratio = (wick / body) if body > 1e-9 else (1.0 if wick>0 else 0.0)
+    candle = {
+        "open": open_p,
+        "close": close_p,
+        "high": high,
+        "low": low,
+        "body": body,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "wick_ratio": wick_ratio
+    }
+    return candle
+
+def is_bandwalk(sym):
+    """
+    Band-walk protection:
+    If price repeatedly touches the same outer band without strong rejection,
+    treat as band-walk (trend hugging band) and skip entries.
+    Simple heuristic: last BB_PERIOD prices > mid and > 0.9*(upper band distance)
+    """
+    prices = last_n_prices(sym, BB_PERIOD)
+    if len(prices) < BB_PERIOD:
+        return False
+    bb = bollinger(prices, BB_PERIOD, BB_STD)
+    if not bb:
+        return False
+    upper, mid, lower = bb
+    # count times price within 0.5% of upper
+    near_upper = sum(1 for p in prices if p >= upper * 0.995)
+    near_lower = sum(1 for p in prices if p <= lower * 1.005)
+    # if many recent prices hug upper or lower, bandwalk
+    if near_upper >= BB_PERIOD * 0.6 or near_lower >= BB_PERIOD * 0.6:
+        return True
+    return False
+
+def volatility_spike(sym):
+    """
+    Volatility guard based on 1-min approx candle % move.
+    """
+    c = minute_candle_from_buffer(sym)
+    if not c:
+        return False
+    if c["high"] <= 0:
+        return False
+    move_pct = (c["high"] - c["low"]) / ((c["high"] + c["low"]) / 2.0)
+    return move_pct > VOLATILITY_THRESHOLD
+
+def wick_strength_ok(sym, side):
+    """
+    Ensure there is a rejection wick on the band-touch candle.
+    For short (upper band) require upper wick >= WICK_MIN_RATIO * candle_size
+    For long (lower band) require lower wick >= WICK_MIN_RATIO * candle_size
+    """
+    c = minute_candle_from_buffer(sym)
+    if not c:
+        return False
+    body = max(c["body"], 1e-9)
+    if side == "sell":
+        return (c["upper_wick"] / body) >= WICK_MIN_RATIO
+    else:
+        return (c["lower_wick"] / body) >= WICK_MIN_RATIO
+
+def microflow_momentum(sym, window=0.4):
+    """
+    Sum buy - sell volume in last window seconds.
+    Positive -> net buying, Negative -> net selling.
+    Uses st.trades entries where each trade is {price,size,side,ts}.
+    """
+    now = time.time()
+    trades = [t for t in st.trades[sym] if now - t["ts"] <= window]
+    buy = sum(t["size"] for t in trades if t["side"]=="buy")
+    sell = sum(t["size"] for t in trades if t["side"]=="sell")
+    return buy - sell
+
+def check_reversal_signal(sym):
+    """
+    Returns signal dict {"side":"buy"/"sell","mid":mid, "reason":...} or None.
+    """
+    prices = list(st.prices[sym])
+    if len(prices) < BB_PERIOD + 3:
+        return None
+
+    bb = bollinger(prices, BB_PERIOD, BB_STD)
+    if not bb:
+        return None
+    upper, midbb, lower = bb
+    mid_price = prices[-1]
+
+    # Band-walk or volatility guards
+    if is_bandwalk(sym):
+        # skip trading during band-walk
+        return None
+    if volatility_spike(sym):
+        return None
+
+    # Determine side by band touch (allow slight pierce)
+    touched_upper = mid_price >= upper * 0.995
+    touched_lower = mid_price <= lower * 1.005
+
+    if not (touched_upper or touched_lower):
+        return None
+
+    # Microflow: require momentum fade against band
+    mf = microflow_momentum(sym, window=0.4)
+    # For short (upper) we want microflow to be negative (selling pressure) or cooling buys
+    if touched_upper:
+        if mf >= 0:
+            return None
+        side = "sell"
+    else:
+        if mf <= 0:
+            return None
+        side = "buy"
+
+    # RSI curl: compare RSI now vs RSI without last sample
+    r_now = rsi(prices, RSI_PERIOD)
+    if r_now is None:
+        return None
+    r_prev = rsi(prices[:-1], RSI_PERIOD) if len(prices) > RSI_PERIOD+2 else None
+    if r_prev is None:
+        return None
+    # For sell, RSI should curl down (r_now < r_prev). For buy, r_now > r_prev
+    if side == "sell" and not (r_now < r_prev):
+        return None
+    if side == "buy" and not (r_now > r_prev):
+        return None
+
+    # Wick strength
+    if not wick_strength_ok(sym, side):
+        return None
+
+    # All conditions passed
+    return {"side": side, "mid": mid_price, "bb": (upper, midbb, lower)}
+
+# -----------------------------------------
+# ENTRY / CONFIRMATION
+# -----------------------------------------
+async def set_pending(sym, sig):
+    global pending
+    # respect cooldown
+    if time.time() < cooldown_until:
+        return
+    pending = {
+        "sym": sym,
+        "side": sig["side"],
+        "mid": sig["mid"],
+        "ts": time.time()
+    }
+    print(f"[PENDING] {sym} {sig['side'].upper()} at {sig['mid']:.4f}")
+
+async def confirm_and_entry():
+    """
+    Called frequently to confirm pending entry after CONFIRM_DELAY and open market order.
+    """
+    global pending, position, cooldown_until
+    if not pending:
+        return
+    if time.time() - pending["ts"] < CONFIRM_DELAY:
+        return
+
+    sym = pending["sym"]
+    side = pending["side"]
+
+    # Re-evaluate signal at confirmation time
+    sig = check_reversal_signal(sym)
+    if not sig or sig["side"] != side:
+        print(f"[PENDING DROPPED] {sym} {side} confirmation failed")
+        pending = None
+        return
+
+    # Compute notional/qty
+    try:
+        eq = await ex.equity()
+    except Exception as e:
+        print("Equity fetch failed:", e)
+        pending = None
+        return
+    if eq <= 0:
+        pending = None
+        return
+    notional = eq * USE_EQUITY * LEVERAGE
+    mid_price = sig["mid"]
+    qty = notional / mid_price
+    qty = round(qty, 3)
+    if qty <= 0:
+        pending = None
+        return
+
+    # Final pre-entry checks (one more microflow check)
+    mf = microflow_momentum(sym, window=0.35)
+    if side == "sell" and mf >= 0:
+        print("[ENTRY BLOCKED] microflow flipped to buy")
+        pending = None
+        return
+    if side == "buy" and mf <= 0:
+        print("[ENTRY BLOCKED] microflow flipped to sell")
+        pending = None
+        return
+
+    # Place market order
+    try:
+        ord = await ex.market(sym, side, qty)
+        entry_price = float(ord.get("average") or ord.get("price") or mid_price)
+    except Exception as e:
+        print("Market order failed:", e)
+        pending = None
+        return
+
+    # compute TP/SL
+    if side == "buy":
+        tp = entry_price * (1.0 + TP_PCT)
+        sl = entry_price * (1.0 - SL_PCT)
+    else:
+        tp = entry_price * (1.0 - TP_PCT)
+        sl = entry_price * (1.0 + SL_PCT)
+
+    position = {
+        "sym": sym,
+        "side": side,
+        "qty": qty,
+        "entry": entry_price,
+        "tp": tp,
+        "sl": sl,
+        "ts": time.time()
+    }
+
+    print(f"[ENTRY] {sym} {side.upper()} entry={entry_price:.4f} tp={tp:.4f} sl={sl:.4f}")
+    pending = None
+
+# -----------------------------------------
+# WATCHDOG + MAIN LOOP
+# -----------------------------------------
+async def watchdog():
+    """
+    Monitors open position for TP/SL using mid-price from recent buffer.
+    """
+    global position, cooldown_until
+    if not position:
+        return
+    sym = position["sym"]
+    if len(st.prices[sym]) == 0:
+        return
+    mid = st.prices[sym][-1]
+    side = position["side"]
+
+    # TP
+    if (side == "buy" and mid >= position["tp"]) or (side == "sell" and mid <= position["tp"]):
+        print(f"[TP] {sym} hit TP at {mid:.4f}")
         try:
-            cmd = input("")
-        except EOFError:
-            return
-        cmd = cmd.strip().lower()
-        if cmd == "ws":
-            ts_map = {s: mkt.books[s]["ts"] for s in SYMBOLS_WS}
-            print("[DEBUG] book ts =", ts_map, flush=True)
-        elif cmd == "trades":
-            counts = {s: len(mkt.trades[s]) for s in SYMBOLS_WS}
-            print("[DEBUG] trades len =", counts, flush=True)
-        elif cmd == "pos":
-            print("[DEBUG] position =", bot.position, flush=True)
-        elif cmd == "help":
-            print(help_text, flush=True)
-        else:
-            print("[DEBUG] Unknown cmd.", flush=True)
+            await ex.close_all(sym)
+        except:
+            pass
+        position = None
+        cooldown_until = time.time() + COOLDOWN
+        return
 
+    # SL
+    if (side == "buy" and mid <= position["sl"]) or (side == "sell" and mid >= position["sl"]):
+        print(f"[SL] {sym} hit SL at {mid:.4f}")
+        try:
+            await ex.close_all(sym)
+        except:
+            pass
+        position = None
+        cooldown_until = time.time() + COOLDOWN
+        return
 
-async def main():
-    print(f"Starting {BOT_VERSION} ...", flush=True)
-    exchange = ExchangeClient()
-    mkt = MarketState()
-    bot = ScalperBot(exchange, mkt)
-    threading.Thread(target=debug_console, args=(mkt, bot), daemon=True).start()
-    await bot.init_equity_and_leverage()
-    ws_task = asyncio.create_task(ws_loop(mkt))
+async def main_loop():
+    # warm up: set leverage
+    for s in SYMBOLS:
+        await ex.leverage(s)
+    # start WS task
+    ws_task = asyncio.create_task(ws_loop())
+
     try:
         while True:
-            await bot.maybe_kill_switch()
-            await bot.eval_symbols_and_maybe_enter()
-            await bot.watchdog_position()
-            await bot.maybe_heartbeat()
-            await asyncio.sleep(0.20)
+            # if no position, scan for signals
+            if not position:
+                # iterate symbols quickly to find candidates
+                for s in SYMBOLS:
+                    try:
+                        sig = check_reversal_signal(s)
+                    except Exception as e:
+                        sig = None
+                    if sig:
+                        await set_pending(s, sig)
+                        # after setting first pending, break to allow confirmation stage
+                        break
+                # try confirming any pending
+                await confirm_and_entry()
+            else:
+                # watchdog for active pos
+                await watchdog()
+
+            await asyncio.sleep(0.12)  # main tick ~120ms
     finally:
         ws_task.cancel()
         try:
             await ws_task
-        except Exception:
+        except:
             pass
-
 
 if __name__ == "__main__":
     try:
         import uvloop
         uvloop.install()
-    except Exception:
+    except:
         pass
-    try:
-        asyncio.run(main())
-    except asyncio.CancelledError:
-        pass
+    asyncio.run(main_loop())
