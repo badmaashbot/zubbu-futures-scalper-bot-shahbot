@@ -573,8 +573,12 @@ class ScalperBot:
         # skip-log cooldown (local reference)
         self.last_skip_log = LAST_SKIP_LOG
 
-        # BTC volatility guard last log
+        # BTC volatility guard last log (legacy quick guard)
         self.last_btc_guard_ts: float = 0.0
+
+        # ONE-SHOT guard state (new)
+        self.guard_active: bool = False
+        self.guard_start_ts: float = 0.0
 
         # pending entry for confirmation delay (Option A)
         self.pending_entry: Optional[dict] = None
@@ -761,8 +765,698 @@ class ScalperBot:
 
         now = time.time()
 
-        # BTC volatility guard (keep old guard)
+        # ---------------- BTC Volatility One-Shot Guard (60s) ----------------
+        # Uses 1m buffer for BTC. If a large move happens, block new entries for 60s.
         btc_buf = self.price_1m.get("BTCUSDT")
+        if btc_buf and len(btc_buf) >= 2:
+            p_first = btc_buf[0][1]
+            p_last = btc_buf[-1][1]
+            if p_first > 0:
+                btc_change = abs(p_last - p_first) / p_first
+
+                # Trigger guard if BTC spikes and guard currently OFF
+                if btc_change > BTC_VOL_GUARD_PCT and not self.guard_active:
+                    self.guard_active = True
+                    self.guard_start_ts = now
+                    print(f"[GUARD] BTC spike {btc_change:.4f} > {BTC_VOL_GUARD_PCT:.4f} -> blocking 60s", flush=True)
+                    await send_telegram("⚠️ GUARD TRIGGERED — BTC volatility high, pausing 60s")
+
+                # If guard active, block entries for 60 seconds then reset
+                if self.guard_active:
+                    if now - self.guard_start_ts < 60.0:
+                        # still cooling
+                        await self.maybe_heartbeat()
+                        return
+                    else:
+                        self.guard_active = False
+                        print("[GUARD] Reset — entries re-enabled", flush=True)
+                        await send_telegram("🟢 GUARD RESET — entries re-enabled")
+
+        # legacy BTC fast guard/log (keeps the previous behavior log cadence)
+        if btc_buf and len(btc_buf) >= 2:
+            p_first = btc_buf[0][1]
+            p_last = btc_buf[-1][1]
+            if p_first > 0:
+                btc_change = abs(p_last - p_first) / p_first
+                if btc_change > 0.004:
+                    if now - self.last_btc_guard_ts > 10.0:
+                        self.last_btc_guard_ts = now
+                        print(
+                            f"[GUARD] BTC 1m move={btc_change:.4f} > 0.004 -> skip entries",
+                            flush=True
+                        )
+                    await self.maybe_heartbeat()
+                    return
+
+        # If we have a pending entry — check confirmation
+        if self.pending_entry:
+            pe = self.pending_entry
+            if now - pe["ts"] >= CONFIRMATION_DELAY:
+                sym = pe["symbol"]
+                side = pe["side"]
+                feat_new = self.mkt.compute_features(sym)
+                if not feat_new:
+                    self.pending_entry = None
+                else:
+                    # Re-evaluate the Option A conditions quickly
+                    ok = self._check_option_a_conditions(sym, side, feat_new)
+                    if ok:
+                        await self._open_entry_from_pending(sym, feat_new, side)
+                        self.pending_entry = None
+                        return
+                    else:
+                        self._log_skip(sym, "confirm_failed", feat_new, "confirmation failed")
+                        await send_telegram(f"❌ PENDING DROPPED {sym} {side.upper()}")
+                        self.pending_entry = None
+            else:
+                # still waiting for confirm time
+                await self.maybe_heartbeat()
+                return
+
+        # Scan for new signal
+        best_sym = None
+        best_feat = None
+        best_side = None
+
+        for sym in SYMBOLS_WS:
+            feat = self.mkt.compute_features(sym)
+            if not feat:
+                continue
+
+            mid = feat["mid"]
+
+            # Update price buffers
+            self._update_price_buffers(sym, mid, now)
+            ctx_1m = self._get_1m_context(sym)
+            if not ctx_1m:
+                continue
+
+            prices_1m = ctx_1m["prices"]
+            # Need enough samples for indicators
+            if len(prices_1m) < max(BB_PERIOD, RSI_PERIOD) + 2:
+                continue
+
+            # Compute bollinger
+            bb = bollinger_from_prices(prices_1m, BB_PERIOD, BB_STD)
+            if not bb:
+                self._log_skip(sym, "bb_not_ready", feat, "")
+                continue
+            upper, midbb, lower = bb
+
+            last_price = prices_1m[-1]
+
+            # Check touch extremes
+            touched_upper = last_price >= upper * 0.995
+            touched_lower = last_price <= lower * 1.005
+            if not (touched_upper or touched_lower):
+                self._log_skip(sym, "bb_not_touch", feat, "")
+                continue
+
+            # Build minute candle (open/close/high/low)
+            open_p = ctx_1m["open"]
+            close_p = ctx_1m["close"]
+            high_p = ctx_1m["high"]
+            low_p = ctx_1m["low"]
+            body = abs(close_p - open_p)
+            if body <= 1e-9:
+                self._log_skip(sym, "tiny_body", feat, "")
+                continue
+            upper_wick = max(0.0, high_p - max(open_p, close_p))
+            lower_wick = max(0.0, min(open_p, close_p) - low_p)
+
+            # Determine side candidate
+            side = "sell" if touched_upper else "buy"
+
+            # Wick strength
+            wick_ok = False
+            if side == "sell":
+                if upper_wick / body >= WICK_MIN_RATIO:
+                    wick_ok = True
+            else:
+                if lower_wick / body >= WICK_MIN_RATIO:
+                    wick_ok = True
+            if not wick_ok:
+                self._log_skip(sym, "weak_wick", feat, f"up={upper_wick:.6f} low={lower_wick:.6f}")
+                continue
+
+            # RSI curl confirmation
+            r_now = rsi_from_prices(prices_1m, RSI_PERIOD)
+            r_prev = rsi_from_prices(prices_1m[:-1], RSI_PERIOD)
+            if r_now is None or r_prev is None:
+                self._log_skip(sym, "rsi_not_ready", feat, "")
+                continue
+            if side == "sell" and not (r_now < r_prev):
+                self._log_skip(sym, "rsi_no_curl_down", feat, f"rnow={r_now:.2f} rprev={r_prev:.2f}")
+                continue
+            if side == "buy" and not (r_now > r_prev):
+                self._log_skip(sym, "rsi_no_curl_up", feat, f"rnow={r_now:.2f} rprev={r_prev:.2f}")
+                continue
+
+            # Microflow fade (use recent trades)
+            now_ts = time.time()
+            buys = 0.0
+            sells = 0.0
+            for t in reversed(self.mkt.trades[sym]):
+                if now_ts - t["ts"] > MICROFLOW_WINDOW:
+                    break
+                if t["side"] == "buy":
+                    buys += t["size"]
+                else:
+                    sells += t["size"]
+            microflow = buys - sells
+            # For a short candidate (touched upper), microflow should be negative (selling pressure)
+            if side == "sell" and microflow >= 0:
+                self._log_skip(sym, "microflow_not_fade_short", feat, f"mf={microflow:.3f}")
+                continue
+            if side == "buy" and microflow <= 0:
+                self._log_skip(sym, "microflow_not_fade_long", feat, f"mf={microflow:.3f}")
+                continue
+
+            # Volatility guard (skip if massive 1m range)
+            one_min_range_pct = (high_p - low_p) / ((high_p + low_p) / 2.0) if (high_p + low_p) > 0 else 0.0
+            if one_min_range_pct > VOLATILITY_THRESHOLD:
+                self._log_skip(sym, "vol_spike", feat, f"rng={one_min_range_pct:.4f}")
+                continue
+
+            # All Option A filters passed — mark as candidate
+            # Score by absolute microflow and imbalance (simple)
+            score = abs(feat.get("imbalance", 0.0)) + abs(microflow)
+            if score > 0 and score > (best_feat["score"] if best_feat else 0):
+                best_sym = sym
+                best_feat = {"feat": feat, "score": score, "last_price": last_price}
+                best_side = side
+
+        if not best_sym:
+            await self.maybe_heartbeat()
+            return
+
+        # Anti-spam: don't trigger same symbol too fast
+        if now - self.mkt.last_signal_ts[best_sym] < 0.5:
+            return
+        self.mkt.last_signal_ts[best_sym] = now
+
+        # Set pending entry for confirmation
+        self.pending_entry = {
+            "symbol": best_sym,
+            "side": best_side,
+            "ts": now
+        }
+        print(f"[SIGNAL] {best_sym} {best_side.upper()} — pending {CONFIRMATION_DELAY}s confirmation")
+        await send_telegram(f"⏳ PENDING {best_sym} {best_side.upper()} — confirm {CONFIRMATION_DELAY}s")
+
+    # Helper: re-evaluate Option A conditions (used for confirmation)
+    def _check_option_a_conditions(self, sym: str, side: str, feat: dict) -> bool:
+        """
+        Re-check the same Option A filters quickly before entry (used during confirmation).
+        """
+        now = time.time()
+        mid = feat["mid"]
+        self._update_price_buffers(sym, mid, now)
+        ctx = self._get_1m_context(sym)
+        if not ctx:
+            return False
+        prices = ctx["prices"]
+        if len(prices) < max(BB_PERIOD, RSI_PERIOD) + 2:
+            return False
+        bb = bollinger_from_prices(prices, BB_PERIOD, BB_STD)
+        if not bb:
+            return False
+        upper, midbb, lower = bb
+        last_price = prices[-1]
+        touched_upper = last_price >= upper * 0.995
+        touched_lower = last_price <= lower * 1.005
+        if side == "sell" and not touched_upper:
+            return False
+        if side == "buy" and not touched_lower:
+            return False
+        open_p = ctx["open"]
+        close_p = ctx["close"]
+        high_p = ctx["high"]
+        low_p = ctx["low"]
+        body = abs(close_p - open_p)
+        if body <= 1e-9:
+            return False
+        upper_wick = max(0.0, high_p - max(open_p, close_p))
+        lower_wick = max(0.0, min(open_p, close_p) - low_p)
+        if side == "sell":
+            if upper_wick / body < WICK_MIN_RATIO:
+                return False
+        else:
+            if lower_wick / body < WICK_MIN_RATIO:
+                return False
+        r_now = rsi_from_prices(prices, RSI_PERIOD)
+        r_prev = rsi_from_prices(prices[:-1], RSI_PERIOD)
+        if r_now is None or r_prev is None:
+            return False
+        if side == "sell" and not (r_now < r_prev):
+            return False
+        if side == "buy" and not (r_now > r_prev):
+            return False
+        # microflow
+        buys = sells = 0.0
+        now_ts = time.time()
+        for t in reversed(self.mkt.trades[sym]):
+            if now_ts - t["ts"] > MICROFLOW_WINDOW:
+                break
+            if t["side"] == "buy":
+                buys += t["size"]
+            else:
+                sells += t["size"]
+        microflow = buys - sells
+        if side == "sell" and microflow >= 0:
+            return False
+        if side == "buy" and microflow <= 0:
+            return False
+        # passed all
+        return True
+
+    # Open position based on Option A fixed TP/SL
+    async def _open_entry_from_pending(self, sym: str, feat: dict, side: str):
+        """
+        Execute market entry with fixed TP and SL (Option A).
+        """
+        try:
+            equity = await self.exchange.fetch_equity()
+        except Exception:
+            return
+        if equity <= 0:
+            return
+        mid = feat["mid"]
+        notional = equity * EQUITY_USE_FRACTION * LEVERAGE
+        if mid <= 0:
+            return
+        qty = notional / mid
+        min_qty = MIN_QTY_MAP.get(sym, 0.0)
+        if qty < min_qty:
+            print(f"[SKIP ENTRY] {sym} qty {qty:.6f} < min {min_qty}", flush=True)
+            await send_telegram(f"❌ ENTRY SKIPPED {sym} qty too small")
+            return
+        qty = math.floor(qty * 1000) / 1000.0
+        if qty <= 0:
+            return
+        # ENTRY: market order
+        try:
+            order = await self.exchange.create_market_order(sym, side, qty, reduce_only=False)
+            entry_price = safe_float(order.get("average") or order.get("price"), mid) or mid
+        except Exception as e:
+            print(f"[ENTRY ERROR] {sym}: {e}")
+            await send_telegram(f"❌ Entry failed for {sym}")
+            return
+        # compute TP/SL fixed
+        if side == "buy":
+            tp_price = entry_price * (1.0 + TP_PCT)
+            sl_price = entry_price * (1.0 - SL_PCT)
+        else:
+            tp_price = entry_price * (1.0 - TP_PCT)
+            sl_price = entry_price * (1.0 + SL_PCT)
+        # place TP as limit reduce-only maker
+        opp_side = "sell" if side == "buy" else "buy"
+        try:
+            await self.exchange.create_limit_order(
+                sym,
+                opp_side,
+                qty,
+                tp_price,
+                reduce_only=True,
+                post_only=True,
+            )
+        except Exception as e:
+            print(f"[TP ERROR] {sym}: {e}")
+            await send_telegram(f"⚠️ TP order placement failed for {sym}")
+        self.position = Position(
+            symbol_ws=sym,
+            side=side,
+            qty=qty,
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            opened_ts=time.time(),
+        )
+        self.last_trade_time = time.time()
+        print(
+            f"[ENTRY] {sym} {side.upper()} qty={qty} entry={entry_price:.4f} "
+            f"TP={tp_price:.4f} SL={sl_price:.4f}"
+        )
+        await send_telegram(
+            f"📌 ENTRY {sym} {side.upper()} qty={qty} entry={entry_price:.4f} "
+            f"TP={tp_price:.4f} SL={sl_price:.4f}"
+        )
+
+    # -------------------------------------------------
+    # risk watchdog: detect TP/SL hits + backup SL + ladder trail
+    # (kept simple for Option A)
+    # -------------------------------------------------
+    async def watchdog_position(self):
+        """
+        - Detect if exchange closed position (TP hit or SL hit)
+        - If still open, apply backup SL check
+        """
+        if not self.position:
+            return
+
+        pos = self.position
+        sym = pos.symbol_ws
+
+        # ========== 1) CHECK IF POSITION SIZE OPEN OR CLOSED ==========
+        size = await self.exchange.get_position_size(sym)
+
+        # If exchange shows no open position -> TP or SL executed
+        if size <= 0:
+            # Recompute last move for reason calculation
+            feat = self.mkt.compute_features(sym)
+            reason = "unknown"
+            was_loss = True
+
+            if feat:
+                mid = feat["mid"]
+                if pos.side == "buy":
+                    move = (mid - pos.entry_price) / pos.entry_price
+                else:
+                    move = (pos.entry_price - mid) / pos.entry_price
+
+                # Profit or loss detection
+                if move > 0:
+                    reason = "TP filled (profit)"
+                    was_loss = False
+                else:
+                    reason = "SL filled (loss)"
+                    was_loss = True
+
+            # -------- LOG & TELEGRAM --------
+            print(
+                f"[EXIT DETECTED] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"tp={pos.tp_price:.4f} sl={pos.sl_price:.4f} reason={reason}"
+            )
+            await send_telegram(
+                f"📤 EXIT — {sym} {pos.side.upper()} entry={pos.entry_price:.4f}\n"
+                f"➡️ {reason}"
+            )
+
+            # set exit cooldown
+            self.last_exit_ts = time.time()
+            self.last_exit_was_loss = was_loss
+
+            # CLEAR POSITION
+            self.position = None
+            return
+
+        # ========== 2) IF STILL OPEN, GET CURRENT PRICE ==========
+        feat = self.mkt.compute_features(sym)
+        if not feat:
+            return
+        mid = feat["mid"]
+        if mid <= 0:
+            return
+
+        # ========== 3) BACKUP SL CHECK ==========
+        hit = False
+
+        # long backup SL
+        if pos.side == "buy" and mid <= pos.sl_price:
+            hit = True
+
+        # short backup SL
+        if pos.side == "sell" and mid >= pos.sl_price:
+            hit = True
+
+        if hit:
+            # Force close market
+            await self.exchange.close_position_market(sym)
+
+            print(
+                f"[BACKUP SL] {sym} {pos.side.upper()} entry={pos.entry_price:.4f} "
+                f"SL={pos.sl_price:.4f} now={mid:.4f}"
+            )
+            await send_telegram(
+                f"🛑 BACKUP SL — {sym} {pos.side.upper()}\n"
+                f"Entry={pos.entry_price:.4f}  SL={pos.sl_price:.4f}"
+            )
+
+            # set exit cooldown as loss
+            self.last_exit_ts = time.time()
+            self.last_exit_was_loss = True
+
+            self.position = None
+            return
+
+    # -------------------------------------------------
+    # idle heartbeat
+    # -------------------------------------------------
+    async def maybe_heartbeat(self):
+        """
+        Idle heartbeat every HEARTBEAT_IDLE_SEC when no trades.
+        """
+        now = time.time()
+        if now - self.last_trade_time < HEARTBEAT_IDLE_SEC:
+            return
+        if now - self.last_heartbeat_ts < HEARTBEAT_IDLE_SEC:
+            return
+        self.last_heartbeat_ts = now
+        eq = await self.exchange.fetch_equity()
+        print(f"[HEARTBEAT] idle, equity={eq:.2f}")
+        await send_telegram(
+            f"💤 Bot idle {HEARTBEAT_IDLE_SEC/60:.0f} min. Equity={eq:.2f} USDT"
+        )# --------------- CORE BOT LOGIC (Option A) -----------------
+
+
+class ScalperBot:
+    def __init__(self, exchange: ExchangeClient, mkt: MarketState):
+        self.exchange = exchange
+        self.mkt = mkt
+
+        self.position: Optional[Position] = None
+        self.start_equity: Optional[float] = None
+        self.last_trade_time: float = 0.0
+        self.last_heartbeat_ts: float = 0.0
+
+        # price history buffers for 1m + 5m + 15m structure
+        self.price_1m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
+        self.price_5m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
+        self.price_15m: Dict[str, deque] = {s: deque() for s in SYMBOLS_WS}
+
+        # skip-log cooldown (local reference)
+        self.last_skip_log = LAST_SKIP_LOG
+
+        # BTC volatility guard last log (legacy quick guard)
+        self.last_btc_guard_ts: float = 0.0
+
+        # ONE-SHOT guard state (new)
+        self.guard_active: bool = False
+        self.guard_start_ts: float = 0.0
+
+        # pending entry for confirmation delay (Option A)
+        self.pending_entry: Optional[dict] = None
+
+        # exit cooldown state
+        self.last_exit_ts: float = 0.0
+        self.last_exit_was_loss: bool = False
+
+        # last watchdog timestamp (for 0.5s-ish frequency)
+        self.last_watchdog_ts: float = 0.0
+
+        # simple liquidity footprint memory per symbol (kept for compatibility)
+        self.last_liq_state: Dict[str, Optional[dict]] = {s: None for s in SYMBOLS_WS}
+
+    # -------------------------------------------------
+    # helpers: structure + trend + logging
+    # -------------------------------------------------
+    def _update_price_buffers(self, sym: str, mid: float, now: float) -> None:
+        """Keep 1m + 5m + 15m rolling mid-price history."""
+        buf1 = self.price_1m[sym]
+        buf5 = self.price_5m[sym]
+        buf15 = self.price_15m[sym]
+
+        buf1.append((now, mid))
+        buf5.append((now, mid))
+        buf15.append((now, mid))
+
+        cutoff1 = now - 60.0       # 1 minute
+        cutoff5 = now - 300.0      # 5 minutes
+        cutoff15 = now - 900.0     # 15 minutes
+
+        while buf1 and buf1[0][0] < cutoff1:
+            buf1.popleft()
+        while buf5 and buf5[0][0] < cutoff5:
+            buf5.popleft()
+        while buf15 and buf15[0][0] < cutoff15:
+            buf15.popleft()
+
+    def _get_1m_context(self, sym: str) -> Optional[dict]:
+        """
+        Returns 1m micro structure for symbol:
+          - high, low, range
+          - position of current price inside that range (0..1)
+          - near_support / near_resistance flags
+        """
+        buf = self.price_1m[sym]
+        if len(buf) < 5:
+            return None
+
+        prices = [p for _, p in buf]
+        high = max(prices)
+        low = min(prices)
+        rng = high - low
+        if rng <= 0:
+            return None
+
+        last_price = prices[-1]
+        pos_in_range = (last_price - low) / rng  # 0 bottom, 1 top
+
+        ctx = {
+            "high": high,
+            "low": low,
+            "range": rng,
+            "pos": pos_in_range,
+            "near_support": pos_in_range <= 0.2,
+            "near_resistance": pos_in_range >= 0.8,
+            "open": prices[0],
+            "close": prices[-1],
+            "prices": prices
+        }
+        return ctx
+
+    def _get_5m_trend(self, sym: str) -> Optional[dict]:
+        buf = self.price_5m[sym]
+        if len(buf) < 10:
+            return None
+        prices = [p for _, p in buf]
+        first = prices[0]
+        last = prices[-1]
+        if first <= 0:
+            return None
+        change = (last - first) / first
+        if change > 0.002:
+            trend = "up"
+        elif change < -0.002:
+            trend = "down"
+        else:
+            trend = "flat"
+        return {"trend": trend, "change": change}
+
+    def _get_15m_trend(self, sym: str) -> Optional[dict]:
+        buf = self.price_15m[sym]
+        if len(buf) < 10:
+            return None
+        prices = [p for _, p in buf]
+        first = prices[0]
+        last = prices[-1]
+        if first <= 0:
+            return None
+        change = (last - first) / first
+        if change > 0.004:
+            trend = "up"
+        elif change < -0.004:
+            trend = "down"
+        else:
+            trend = "flat"
+        return {"trend": trend, "change": change}
+
+    def _log_skip(self, sym: str, reason: str, feat: dict, extra: str = "") -> None:
+        """
+        Rate-limited skip logger so you see WHY the bot is not trading.
+        """
+        now = time.time()
+        key = f"{sym}:{reason}"
+        last = self.last_skip_log.get(key, 0.0)
+        if now - last < SKIP_LOG_COOLDOWN:
+            return  # only log same reason every few seconds per symbol
+
+        self.last_skip_log[key] = now
+        mid = feat.get("mid", 0.0)
+        spread = feat.get("spread", 0.0)
+        imb = feat.get("imbalance", 0.0)
+        burst = feat.get("burst", 0.0)
+        b_micro = feat.get("burst_micro", 0.0)
+        rng = feat.get("range_pct", 0.0)
+        slope = feat.get("burst_slope", 0.0)
+        tcount = feat.get("trade_count", 0)
+        tvel = feat.get("trade_velocity", 0.0)
+
+        msg = (
+            f"[SKIP] {sym} {reason} {extra} | "
+            f"mid={mid:.4f} spread={spread:.6f} "
+            f"imb={imb:.4f} burst={burst:.4f} micro={b_micro:.4f} "
+            f"slope={slope:.4f} trades={tcount} vel={tvel:.2f} rng={rng:.6f}"
+        )
+        print(msg, flush=True)
+
+    # -------------------------------------------------
+    # lifecycle
+    # -------------------------------------------------
+    async def init_equity_and_leverage(self):
+        eq = await self.exchange.fetch_equity()
+        self.start_equity = eq
+        print(f"[INIT] Equity: {eq:.2f} USDT — {BOT_VERSION}")
+        await send_telegram(
+            f"🟢 Bot started ({BOT_VERSION}). Equity: {eq:.2f} USDT. "
+            f"Kill at {KILL_SWITCH_DD*100:.1f}% DD."
+        )
+        # set leverage for all symbols
+        for s in SYMBOLS_WS:
+            await self.exchange.set_leverage(s, LEVERAGE)
+        print("[INIT] Leverage set for all symbols.")
+        await send_telegram("⚙️ Leverage set for all symbols.")
+
+    async def maybe_kill_switch(self):
+        if self.start_equity is None:
+            return
+        eq = await self.exchange.fetch_equity()
+        if self.start_equity <= 0:
+            return
+        dd = (self.start_equity - eq) / self.start_equity
+        if dd >= KILL_SWITCH_DD:
+            if self.position:
+                await self.exchange.close_position_market(self.position.symbol_ws)
+                await send_telegram(
+                    f"🚨 Kill-switch: equity drawdown {dd*100:.2f}%. Position closed."
+                )
+                self.position = None
+            raise SystemExit("Kill-switch triggered")
+
+    # -------------------------------------------------
+    # Option A: main decision loop (pure reversal)
+    # -------------------------------------------------
+    async def eval_symbols_and_maybe_enter(self):
+        """
+        Option A scanning:
+        - For each symbol compute features (orderbook-based features kept)
+        - Use 1m price buffer to compute BB & RSI
+        - Candidate when price touches BB extremes + wick rejection + RSI curl + microflow fade
+        - Set pending_entry and confirm after CONFIRMATION_DELAY
+        """
+        if self.position is not None:
+            return
+
+        now = time.time()
+
+        # ---------------- BTC Volatility One-Shot Guard (60s) ----------------
+        # Uses 1m buffer for BTC. If a large move happens, block new entries for 60s.
+        btc_buf = self.price_1m.get("BTCUSDT")
+        if btc_buf and len(btc_buf) >= 2:
+            p_first = btc_buf[0][1]
+            p_last = btc_buf[-1][1]
+            if p_first > 0:
+                btc_change = abs(p_last - p_first) / p_first
+
+                # Trigger guard if BTC spikes and guard currently OFF
+                if btc_change > BTC_VOL_GUARD_PCT and not self.guard_active:
+                    self.guard_active = True
+                    self.guard_start_ts = now
+                    print(f"[GUARD] BTC spike {btc_change:.4f} > {BTC_VOL_GUARD_PCT:.4f} -> blocking 60s", flush=True)
+                    await send_telegram("⚠️ GUARD TRIGGERED — BTC volatility high, pausing 60s")
+
+                # If guard active, block entries for 60 seconds then reset
+                if self.guard_active:
+                    if now - self.guard_start_ts < 60.0:
+                        # still cooling
+                        await self.maybe_heartbeat()
+                        return
+                    else:
+                        self.guard_active = False
+                        print("[GUARD] Reset — entries re-enabled", flush=True)
+                        await send_telegram("🟢 GUARD RESET — entries re-enabled")
+
+        # legacy BTC fast guard/log (keeps the previous behavior log cadence)
         if btc_buf and len(btc_buf) >= 2:
             p_first = btc_buf[0][1]
             p_last = btc_buf[-1][1]
