@@ -95,6 +95,19 @@ class ExchangeClient:
             }
         self.client = ccxt.bybit(cfg)
 
+    # ---------- added (fix) ----------
+    async def set_leverage(self, sym_ws: str, lev: int):
+        """Fix missing leverage function — required by your bot."""
+        try:
+            await asyncio.to_thread(
+                self.client.set_leverage,
+                lev,
+                SYMBOL_MAP[sym_ws],   # correct unified Bybit symbol
+                {"category": "linear"}
+            )
+        except Exception as e:
+            print(f"[LEV ERROR] {sym_ws}: {e}")
+
     async def fetch_equity(self) -> float:
         def _work():
             bal = self.client.fetch_balance()
@@ -128,7 +141,8 @@ class ExchangeClient:
             return self.client.create_order(symbol, "market", side, qty, None, params)
         return await asyncio.to_thread(_work)
 
-    async def create_limit_order(self, sym_ws: str, side: str, qty: float, price: float, reduce_only: bool = False, post_only: bool = False):
+    async def create_limit_order(self, sym_ws: str, side: str, qty: float, price: float,
+                                 reduce_only: bool = False, post_only: bool = False):
         symbol = SYMBOL_MAP[sym_ws]
         params = {"category": "linear", "timeInForce": "GTC"}
         if reduce_only:
@@ -153,6 +167,7 @@ class ExchangeClient:
             except Exception:
                 pass
         await asyncio.to_thread(_work)
+
 
 # ---------- MARKET STATE (your existing structure) ----------
 class MarketState:
