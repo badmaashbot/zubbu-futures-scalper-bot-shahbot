@@ -413,6 +413,7 @@ class ScalperBot:
 
         now = time.time()
         if now - self.last_exit_ts < (self.cooldown_sl if self.last_exit_was_loss else self.cooldown_tp):
+            self._log_skip("ALL", "cooldown")
             return
         if self._safe_mode_block_entries(now):
             return
@@ -426,6 +427,7 @@ class ScalperBot:
             last = self.mkt.last_candle(sym)
             curr = self.mkt.current_candle(sym)
             if not last or not curr:
+                self._log_skip(sym, "no-candle")
                 continue
 
             # 2. wick rule
@@ -433,18 +435,22 @@ class ScalperBot:
             u_wick = last["high"] - max(last["open"], last["close"])
             l_wick = min(last["open"], last["close"]) - last["low"]
             if body == 0:
+                self._log_skip(sym, "wick")
                 continue
             if not (u_wick >= 3.0 * body or l_wick >= 3.0 * body):
+                self._log_skip(sym, "wick")
                 continue
 
             # 3. volume spike
             vol_sma = self._volume_sma(sym)
             if not vol_sma or last["volume"] < 2.0 * vol_sma:
+                self._log_skip(sym, "volume")
                 continue
 
             # 4. RSI extreme
             rsi = self._rsi(sym)
             if rsi is None:
+                self._log_skip(sym, "rsi")
                 continue
 
             # 5. side
@@ -454,17 +460,20 @@ class ScalperBot:
             if l_wick >= 3.0 * body and rsi <= 20:
                 side = "buy"
             if not side:
+                self._log_skip(sym, "rsi")
                 continue
 
             # 6. confirmation candle
             conf_body = abs(curr["close"] - curr["open"])
             if conf_body < 0.0005 * curr["open"]:  # 0.05 %
+                self._log_skip(sym, "confirmation")
                 continue
             if side == "sell" and curr["close"] < last["close"]:
                 pass
             elif side == "buy" and curr["close"] > last["close"]:
                 pass
             else:
+                self._log_skip(sym, "confirmation")
                 continue
 
             # 7. symbol-level guards
@@ -533,6 +542,7 @@ class ScalperBot:
                 f"TP={tp:.4f} (0.30%) SL={sl:.4f} (0.60%)"
             )
             return   # one entry per loop
+
 
     # ---------- WATCHDOG ----------
     async def watchdog_position(self):
