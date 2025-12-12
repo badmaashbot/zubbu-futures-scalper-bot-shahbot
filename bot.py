@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# ZUBBU_SWEEP_V4.5_COMBINED.py
+# ZUBBU_SWEEP_V4.5_COMBINED_FIXED.py
 # Combined: V4.5 framework (WS/parser/TG/exchange/watchdog) + Sweep entry logic + 1m candle system
+# Parser fixed (robust V5 compact + legacy handling)
 
 import os
 import time
@@ -16,7 +17,7 @@ import aiohttp
 import ccxt  # sync ccxt; heavy calls wrapped with asyncio.to_thread
 
 # ---------------- VERSION ----------------
-BOT_VERSION = "ZUBBU_SWEEP_V4.5_COMBINED"
+BOT_VERSION = "ZUBBU_SWEEP_V4.5_COMBINED_FIXED"
 
 # ---------------- ENV / BASIC CONFIG ----------------
 
@@ -53,11 +54,11 @@ else:
 
 # --------------- TRADING CONFIG -----------------
 
-LEVERAGE = 3
+LEVERAGE = 5
 EQUITY_USE_FRACTION = 0.97  # use up to 97% equity * leverage as position notional
 
 # Static SL (will be used by ladder system)
-SL_PCT = 0.0060   # 0.60% stop loss
+SL_PCT = 0.0030   # 0.30% stop loss
 
 # Sweep-specific constants (from your sweep bot)
 CAPITAL_RISK_PCT = 1.0
@@ -277,40 +278,59 @@ class MarketState:
         self.last_signal_ts: Dict[str, float] = {s: 0.0 for s in SYMBOLS_WS}
         self.last_skip_log: Dict[str, float] = {}
 
-    # Orderbook parser (kept from V4.5)
+    # -------------------------------------------------
+    # FIXED ORDERBOOK UPDATE (robust parser)
+    # -------------------------------------------------
     def update_book(self, symbol: str, data: dict):
+        """
+        Robust parser for Bybit V5 "orderbook.1.<symbol>" stream.
+        Supports:
+          - NEW V5 compact format: {"b": [...], "a": [...], "ts": ...}
+          - DELTA updates where b/a contain qty 0 (delete) or qty>0 (update)
+          - OLD format fallback: {"type": "snapshot"/"delta", "bids": [...], "asks": [...]}
+          - Handles array-wrapped payloads and incremental keys (delete/update/insert)
+        """
         book = self.books[symbol]
 
-        # handle array-wrapped payloads
+        # If payload is an array (sometimes Bybit wraps)
         if isinstance(data, list) and data:
             data = data[0]
 
+        # --- New V5 compact format: "b" / "a" ---
         if isinstance(data, dict) and ("b" in data or "a" in data):
-            ts_raw = data.get("ts") or data.get("t") or (time.time() * 1000)
-            book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
+            # timestamp
+            ts_raw = data.get("ts") or data.get("t") or (time.time() * 1000.0)
+            book["ts"] = safe_float(ts_raw, time.time() * 1000.0) / 1000.0
 
+            # If both sides present, treat as snapshot refresh
             if "b" in data and "a" in data:
                 book["bids"].clear()
                 book["asks"].clear()
+
                 for px, qty in data.get("b", []):
                     p = safe_float(px)
                     q = safe_float(qty)
-                    if p and q:
-                        book["bids"][p] = q
+                    if p is None or q is None or q == 0:
+                        continue
+                    book["bids"][p] = q
+
                 for px, qty in data.get("a", []):
                     p = safe_float(px)
                     q = safe_float(qty)
-                    if p and q:
-                        book["asks"][p] = q
+                    if p is None or q is None or q == 0:
+                        continue
+                    book["asks"][p] = q
+
                 return
 
+            # Otherwise it's a delta in one side
             if "b" in data:
                 for px, qty in data["b"]:
                     p = safe_float(px)
                     q = safe_float(qty)
                     if p is None:
                         continue
-                    if q == 0:
+                    if not q:
                         book["bids"].pop(p, None)
                     else:
                         book["bids"][p] = q
@@ -321,15 +341,17 @@ class MarketState:
                     q = safe_float(qty)
                     if p is None:
                         continue
-                    if q == 0:
+                    if not q:
                         book["asks"].pop(p, None)
                     else:
                         book["asks"][p] = q
+
             return
 
-        # legacy fallback
-        ts_raw = data.get("ts") or (time.time() * 1000)
-        book["ts"] = safe_float(ts_raw, time.time() * 1000) / 1000.0
+        # --- Legacy format fallback ---
+        ts_raw = data.get("ts") or (time.time() * 1000.0)
+        book["ts"] = safe_float(ts_raw, time.time() * 1000.0) / 1000.0
+
         typ = data.get("type")
         if typ == "snapshot":
             book["bids"].clear()
@@ -337,16 +359,18 @@ class MarketState:
             for px, qty in data.get("bids", []):
                 p = safe_float(px)
                 q = safe_float(qty)
-                if p and q:
-                    book["bids"][p] = q
+                if p is None or q is None:
+                    continue
+                book["bids"][p] = q
             for px, qty in data.get("asks", []):
                 p = safe_float(px)
                 q = safe_float(qty)
-                if p and q:
-                    book["asks"][p] = q
+                if p is None or q is None:
+                    continue
+                book["asks"][p] = q
             return
 
-        # incremental updates legacy
+        # incremental updates (legacy)
         for key in ("delete", "update", "insert"):
             part = data.get(key, {})
             for px, qty in part.get("bids", []):
@@ -367,6 +391,8 @@ class MarketState:
                     book["asks"].pop(p, None)
                 else:
                     book["asks"][p] = q
+
+    # -------------------------------------------------
 
     def add_trade(self, symbol: str, trade: dict):
         self.trades[symbol].append(trade)
@@ -623,11 +649,9 @@ class ScalperBot:
 
             # Place market entry using existing open_position code (reuse open_position)
             try:
-                # call open_position which handles order placement, TP placement, and position object
                 await self.open_position(sym, {"mid": mid}, side)
                 self.mkt.last_signal_ts[sym] = time.time()
                 self.counters["executed"] += 1
-                # send_tg done inside open_position
             except Exception as e:
                 self.counters["errors"] += 1
                 print(f"[ENTRY ERROR] {sym}: {e}", flush=True)
@@ -898,8 +922,7 @@ def debug_console(mkt: MarketState, bot: ScalperBot):
         "  ws      - show websocket ready flags\n"
         "  book    - show last orderbook timestamps\n"
         "  trades  - show count of recent trades per symbol\n"
-        "  pos     - show current open position\n"
-        "  help    - show this message\n"
+        "  pos     - show current open position\n        "  help    - show this message\n"
     )
     print(help_text, flush=True)
     while True:
