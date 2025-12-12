@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-#  zubbu_sweep_v1.py  – 90 % accuracy edition
-#  EVERYTHING outside the logic block is untouched.
-
-import os, time, asyncio, json, math
+#  zubbu_sweep_v1.py  – 90 % accuracy edition  –  WITH CONSOLE PULSE + TG ERROR PRINT
+import os
+import time
+import asyncio
+import json
+import math
 from collections import deque
-import aiohttp, ccxt
+import aiohttp
+import ccxt
 
 # ------------------------------------------------
-# 1.  PARAMETER BLOCK  –  CHANGE ONLY HERE
+# 1.  PARAMETERS (same 90 % values)
 # ------------------------------------------------
 SYMBOLS          = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
-CANDLE_TF        = "1m"                    # keep 1 min for fast recycle
-CAPITAL_RISK_PCT = 1.0                     # 1 % equity per trade
-TP_PCT           = 0.30                    # 0.3 % take profit
-SL_PCT           = 0.60                    # 0.6 % stop loss  (RR 0.5)
-MAX_SPREAD_PCT   = 0.04                    # skip if bid/ask > 0.04 %
-BTC_VOL_MAX      = 0.004                   # skip if BTC 1 m range > 0.4 %
-SIGNAL_COOLDOWN  = 180                     # 3 min per symbol
-# ------- 90 % accuracy tuning -------
-SWEEP_WICK_MIN   = 3.0        # wick ≥ 3 × body
-RSI_OB           = 80         # stricter over-bought
-RSI_OS           = 20         # stricter over-sold
-VOL_SPIKE        = 2.0        # volume ≥ 2 × 20-period SMA
-CONFIRM_BODY_PCT = 0.05       # confirmation candle body ≥ 0.05 %
+CANDLE_TF        = "1m"
+CAPITAL_RISK_PCT = 1.0
+TP_PCT           = 0.30
+SL_PCT           = 0.60
+MAX_SPREAD_PCT   = 0.04
+BTC_VOL_MAX      = 0.004
+SIGNAL_COOLDOWN  = 180
+SWEEP_WICK_MIN   = 3.0
+RSI_OB           = 80
+RSI_OS           = 20
+VOL_SPIKE        = 2.0
+CONFIRM_BODY_PCT = 0.05
+
 # ------------------------------------------------
 # 2.  ENVIRONMENT
 # ------------------------------------------------
@@ -36,21 +39,23 @@ WS_URL = ("wss://stream-testnet.bybit.com/v5/public/linear"
           if TESTNET else "wss://stream.bybit.com/v5/public/linear")
 
 # ------------------------------------------------
-# 3.  TELEGRAM
+# 3.  TELEGRAM  (console error if fails)
 # ------------------------------------------------
 async def send_tg(msg: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as session:
+            async with session.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                 data={"chat_id": TG_CHAT_ID, "text": msg},
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=3),
-            )
-    except:
-        pass
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[TG ERROR] {resp.status} - {await resp.text()}")
+    except Exception as e:
+        print(f"[TG ERROR] {e}")
 
 # ------------------------------------------------
 # 4.  MARKET STATE
@@ -61,17 +66,14 @@ class MarketState:
         self.trades = {s: deque(maxlen=3000) for s in SYMBOLS}
         self.candles = {s: deque(maxlen=150) for s in SYMBOLS}
 
-    # ---------- book ----------
     def update_book(self, symbol, data):
         self.books[symbol]["bids"] = {float(p): float(v) for p, v in data["b"]}
         self.books[symbol]["asks"] = {float(p): float(v) for p, v in data["a"]}
         self.books[symbol]["ts"] = time.time()
 
-    # ---------- trade ----------
     def add_trade(self, symbol, trade):
         self.trades[symbol].append(trade)
 
-    # ---------- candle helpers ----------
     def last_candle(self, sym):
         return self.candles[sym][-2] if len(self.candles[sym]) > 1 else None
 
@@ -130,7 +132,7 @@ class ExchangeClient:
         return await asyncio.to_thread(self.client.fetch_balance)
 
 # ------------------------------------------------
-# 6.  BOT  (only logic changed)
+# 6.  BOT
 # ------------------------------------------------
 class LiquiditySweepBot:
     def __init__(self, exchange, mkt):
@@ -176,18 +178,14 @@ class LiquiditySweepBot:
         lower_wick = min(last["open"], last["close"]) - last["low"]
         if body == 0:
             return False, None
-        # wick rule
         if not (upper_wick >= SWEEP_WICK_MIN * body or lower_wick >= SWEEP_WICK_MIN * body):
             return False, None
-        # volume spike
         vol_sma = self.mkt.volume_sma(sym)
         if not vol_sma or last["volume"] < VOL_SPIKE * vol_sma:
             return False, None
-        # rsi
         rsi = self.mkt.rsi(sym)
         if rsi is None:
             return False, None
-        # side
         side = None
         if upper_wick >= SWEEP_WICK_MIN * body and rsi >= RSI_OB:
             side = "Sell"
@@ -195,7 +193,6 @@ class LiquiditySweepBot:
             side = "Buy"
         if not side:
             return False, None
-        # confirmation candle
         curr = self.mkt.current_candle(sym)
         if not curr:
             return False, None
@@ -307,14 +304,15 @@ async def ws_loop(mkt: MarketState):
                         mkt.update_book(sym, data["data"])
 
 # ------------------------------------------------
-# 8.  MAIN
+# 8.  MAIN  (console pulse on start)
 # ------------------------------------------------
 async def main():
     mkt = MarketState()
     ex = ExchangeClient()
     bot = LiquiditySweepBot(ex, mkt)
+    print("ZUBBU 90 % SWEEP BOT STARTED – console silent, TG alerts only.")
     ws_task = asyncio.create_task(ws_loop(mkt))
-    await asyncio.sleep(2)  # let first candles build
+    await asyncio.sleep(2)
     while True:
         try:
             await bot.eval_and_trade()
